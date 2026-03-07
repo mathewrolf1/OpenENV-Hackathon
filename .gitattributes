@@ -1,0 +1,7 @@
+# Handle line endings automatically for text files
+* text=auto
+
+# Explicitly declare that certain files should always use LF
+# This is vital for shell scripts (.sh) or config files used in Linux environments
+*.sh text eol=lf
+*.env* text eol=lf
