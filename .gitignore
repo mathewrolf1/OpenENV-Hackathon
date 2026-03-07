@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env/
+*.egg-info/
+.eggs/
+*.egg
+build/
+dist/
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Northflank CLI
+.northflank/
+
+# Logs and debug
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS and IDE
+.DS_Store
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# Coverage and test
+coverage/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Lock files (optional: uncomment if you don’t want to commit)
+# package-lock.json
