@@ -26,6 +26,9 @@ dist/
 # Northflank CLI
 .northflank/
 
+# Training checkpoints
+checkpoints/
+
 # Logs and debug
 *.log
 npm-debug.log*
