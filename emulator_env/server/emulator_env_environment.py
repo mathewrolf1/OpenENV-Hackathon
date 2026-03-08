@@ -16,8 +16,29 @@ Environment variables:
 
 import os
 import logging
+import configparser
 from typing import Any, Optional
 from uuid import uuid4
+
+# ---------------------------------------------------------------------------
+# Python 3.14 compatibility: configparser now raises DuplicateOptionError by
+# default when an INI file contains duplicate keys.  Slippi's Dolphin.ini
+# ships with duplicate "slippireplaymonthfolders" entries, which crashes
+# libmelee on startup.  We monkey-patch configparser so that new
+# ConfigParser instances default to strict=False (the pre-3.14 behaviour).
+# ---------------------------------------------------------------------------
+_OrigConfigParser = configparser.ConfigParser
+
+
+class _LenientConfigParser(_OrigConfigParser):
+    """ConfigParser that tolerates duplicate keys (strict=False)."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("strict", False)
+        super().__init__(*args, **kwargs)
+
+
+configparser.ConfigParser = _LenientConfigParser  # type: ignore[misc]
 
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
