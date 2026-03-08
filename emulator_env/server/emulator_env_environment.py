@@ -274,16 +274,91 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
 
         log.info("reset(): navigating menus to start a new match ...")
 
+        # Release all controller inputs immediately so stale presses from
+        # the previous episode don't interfere with menu navigation.
+        self.controller.release_all()
+        self.cpu_controller.release_all()
+
         # Fresh helpers so stage_selected / name_tag_index don't carry over.
         self.menu_helper = melee.MenuHelper()
         self.cpu_menu_helper = melee.MenuHelper()
+
+        # ---- Phase 1: Dismiss postgame screen if present ----
+        # POSTGAME_SCORES requires explicit A/START presses to advance.
+        # Some Melee builds need several frames of button presses to advance.
+        _POSTGAME_DISMISS_FRAMES = 180  # 3 seconds max to clear postgame
+        last_menu_state = None
+
+        for dismiss_idx in range(_POSTGAME_DISMISS_FRAMES):
+            gamestate = self.console.step()
+            if gamestate is None:
+                continue
+
+            menu_state = gamestate.menu_state
+
+            # Log transitions for debugging
+            if menu_state != last_menu_state:
+                log.info("reset() phase 1: menu_state=%s (frame %d)",
+                         menu_state, dismiss_idx)
+                last_menu_state = menu_state
+
+            if menu_state in (melee.Menu.IN_GAME, melee.Menu.SUDDEN_DEATH):
+                # Already in a match (shouldn't happen, but handle it)
+                log.info("reset(): already in-game at dismiss frame %d.", dismiss_idx)
+                self._first_match_started = True
+                self._last_gamestate = gamestate
+                if use_recovery:
+                    gamestate = self._run_recovery_setup(gamestate, dismiss_idx)
+                    self._last_gamestate = gamestate
+                return self._make_observation(gamestate, reward=0.0, done=False)
+
+            if menu_state == melee.Menu.POSTGAME_SCORES:
+                # Spam A and START on both controllers to dismiss the screen.
+                # Alternate between A and START every few frames for robustness.
+                if dismiss_idx % 4 < 2:
+                    self.controller.press_button(Button.BUTTON_A)
+                    self.cpu_controller.press_button(Button.BUTTON_A)
+                else:
+                    self.controller.press_button(Button.BUTTON_START)
+                    self.cpu_controller.press_button(Button.BUTTON_START)
+                continue
+
+            # Reached a non-postgame menu state — postgame is dismissed.
+            # Release all buttons and break to phase 2 (menu navigation).
+            self.controller.release_all()
+            self.cpu_controller.release_all()
+            break
+        else:
+            # If we exhausted the loop without breaking, release and continue.
+            self.controller.release_all()
+            self.cpu_controller.release_all()
+            log.warning("reset(): postgame dismiss phase timed out after %d frames.",
+                        _POSTGAME_DISMISS_FRAMES)
+
+        # Small settle period: advance a few frames with no inputs to let
+        # Melee transition cleanly into the CSS (prevents ghost inputs).
+        for _ in range(10):
+            self.controller.release_all()
+            self.cpu_controller.release_all()
+            gamestate = self.console.step()
+
+        # ---- Phase 2: Menu navigation to next match ----
+        last_menu_state = None
 
         for frame_idx in range(_MAX_MENU_FRAMES):
             gamestate = self.console.step()
             if gamestate is None:
                 continue
 
-            if gamestate.menu_state in (
+            menu_state = gamestate.menu_state
+
+            # Log transitions
+            if menu_state != last_menu_state:
+                log.info("reset() phase 2: menu_state=%s (frame %d)",
+                         menu_state, frame_idx)
+                last_menu_state = menu_state
+
+            if menu_state in (
                 melee.Menu.IN_GAME,
                 melee.Menu.SUDDEN_DEATH,
             ):
@@ -294,6 +369,12 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
                     gamestate = self._run_recovery_setup(gamestate, frame_idx)
                     self._last_gamestate = gamestate
                 return self._make_observation(gamestate, reward=0.0, done=False)
+
+            # If we somehow land back on POSTGAME_SCORES, dismiss again.
+            if menu_state == melee.Menu.POSTGAME_SCORES:
+                self.controller.press_button(Button.BUTTON_A)
+                self.cpu_controller.press_button(Button.BUTTON_A)
+                continue
 
             # ---- P2 ----
             if self._cpu_level > 0 and not self._first_match_started:
@@ -397,37 +478,46 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         """
         self._state.step_count += 1
 
-        # Translate the Pydantic action into libmelee controller calls.
+        # Only apply model actions while a match is live.  If we're already
+        # on the postgame/menu screen, release everything and let libmelee's
+        # reset() handle navigation.
+        currently_in_game = (
+            self._last_gamestate is not None
+            and self._last_gamestate.menu_state in (
+                melee.Menu.IN_GAME,
+                melee.Menu.SUDDEN_DEATH,
+            )
+        )
 
-        # Analog sticks
-        self.controller.tilt_analog_unit(
-            Button.BUTTON_MAIN, action.stick_x, action.stick_y
-        )
-        self.controller.tilt_analog_unit(
-            Button.BUTTON_C, action.c_stick_x, action.c_stick_y
-        )
-
-        # Digital buttons – press or release each one.
-        _digital_buttons = (
-            (action.button_a, Button.BUTTON_A),
-            (action.button_b, Button.BUTTON_B),
-            (action.button_x, Button.BUTTON_X),
-            (action.button_y, Button.BUTTON_Y),
-            (action.button_z, Button.BUTTON_Z),
-            (action.button_l, Button.BUTTON_L),
-            (action.button_r, Button.BUTTON_R),
-        )
-        for pressed, button in _digital_buttons:
-            if pressed:
-                self.controller.press_button(button)
-            else:
-                self.controller.release_button(button)
+        if currently_in_game:
+            # Translate the Pydantic action into libmelee controller calls.
+            self.controller.tilt_analog_unit(
+                Button.BUTTON_MAIN, action.stick_x, action.stick_y
+            )
+            self.controller.tilt_analog_unit(
+                Button.BUTTON_C, action.c_stick_x, action.c_stick_y
+            )
+            for pressed, button in (
+                (action.button_a, Button.BUTTON_A),
+                (action.button_b, Button.BUTTON_B),
+                (action.button_x, Button.BUTTON_X),
+                (action.button_y, Button.BUTTON_Y),
+                (action.button_z, Button.BUTTON_Z),
+                (action.button_l, Button.BUTTON_L),
+                (action.button_r, Button.BUTTON_R),
+            ):
+                if pressed:
+                    self.controller.press_button(button)
+                else:
+                    self.controller.release_button(button)
+        else:
+            self.controller.release_all()
 
         # P2: if CPU mode, release all inputs so Dolphin's internal CPU AI drives.
-        # If model mode, run the model policy via the P2 controller.
-        if self._cpu_level > 0:
+        # If model mode, only act while in-game — release otherwise.
+        if self._cpu_level > 0 or not currently_in_game:
             self.cpu_controller.release_all()
-        elif self._last_gamestate is not None:
+        elif currently_in_game:
             if self._p2_model is not None:
                 obs_p2 = self._make_observation(self._last_gamestate, done=False)
                 obs_vec = obs_to_vector(obs_p2, player_idx=1)  # P2 perspective
@@ -461,6 +551,12 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         done = (
             gamestate is not None and gamestate.menu_state == melee.Menu.POSTGAME_SCORES
         )
+
+        # Release all controller inputs the moment the match ends so no model
+        # button presses bleed into menus — libmelee takes over from here.
+        if done:
+            self.controller.release_all()
+            self.cpu_controller.release_all()
 
         obs = self._make_observation(gamestate, done=done)
 

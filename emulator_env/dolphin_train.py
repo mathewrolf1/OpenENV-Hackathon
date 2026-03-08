@@ -51,7 +51,7 @@ from emulator_env.policy_runner import (
     obs_to_vector,
 )
 from rewards.competitive import CompetitiveMeleeReward
-from rewards.puff import PuffReward
+from rewards.puff import PuffReward, PuffWeights
 
 log = logging.getLogger(__name__)
 
@@ -262,7 +262,8 @@ class TrainingStats:
             f"[{bar}] {self.progress_pct():5.1f}% | "
             f"{self.total_frames:,}/{self.target_frames:,} frames | "
             f"{self.fps():.0f} fps | ETA {self.eta_str()}\n"
-            f"  PPO: policy={self.last_policy_loss:.4f} "
+            f"  Episodes: {self.episode_count} | "
+            f"PPO: policy={self.last_policy_loss:.4f} "
             f"value={self.last_value_loss:.4f} "
             f"entropy={self.last_entropy:.2f} | "
             f"batch_reward={self.last_batch_reward:.4f}\n"
@@ -337,7 +338,7 @@ def train(args: argparse.Namespace) -> None:
 
     # Reward calculator
     if args.agent == "puff":
-        reward_calc = PuffReward()
+        reward_calc = PuffReward(weights=PuffWeights.dolphin())
     else:
         reward_calc = CompetitiveMeleeReward()
     log.info("Reward shaping: %s", args.agent)
