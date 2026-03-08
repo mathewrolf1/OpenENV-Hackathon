@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 
 from envs.melee_sim_env import MeleeSimEnv, OBS_DIM
+from opponents import load_opponent
 from physics.constants import Action, STAGE
 from physics.state import CharacterState, GameState, Stage
 
@@ -193,8 +194,8 @@ class ActorCriticMLP(nn.Module):
 # TorchRL integration
 # ---------------------------------------------------------------------------
 
-def _create_env(max_frames: int = 5000) -> gym.Env:
-    base = MeleeSimEnv(max_frames=max_frames)
+def _create_env(max_frames: int = 5000, opponent_fn=None) -> gym.Env:
+    base = MeleeSimEnv(opponent_fn=opponent_fn, max_frames=max_frames)
     return MangoRewardWrapper(base)
 
 
@@ -295,12 +296,23 @@ def _train_ppo(args: argparse.Namespace) -> None:
     if use_amp:
         print("AMP enabled for H100 Tensor Core throughput")
 
+    opponent_fn = None
+    opponent_name = getattr(args, "opponent", None)
+    if opponent_name:
+        opponent_fn = load_opponent(opponent_name)
+        print(f"Cross-play: training vs {opponent_name}")
+
     num_workers = args.num_workers or max(1, (os.cpu_count() or 4) - 1)
+    if opponent_fn:
+        num_workers = 1
+        print("Using 1 worker (cross-play opponent must stay in-process)")
     print(f"Using {num_workers} parallel env workers")
 
     def make_env():
         return GymWrapper(
-            _ActionConverterWrapper(_create_env(max_frames=args.max_frames)),
+            _ActionConverterWrapper(_create_env(
+                max_frames=args.max_frames, opponent_fn=opponent_fn
+            )),
             device="cpu",
         )
 
@@ -832,6 +844,64 @@ def test_reward_logic() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Eval vs cross-play opponent
+# ---------------------------------------------------------------------------
+
+def _evaluate_vs_opponent(opponent_name: str, num_episodes: int = 5) -> None:
+    """Evaluate the latest Mango checkpoint against a named opponent."""
+    from envs.melee_sim_env import _build_obs, _decode_action
+
+    ckpt = _load_latest_checkpoint()
+    if ckpt is None:
+        final = CHECKPOINT_DIR / "mango_final.pt"
+        if final.exists():
+            ckpt = torch.load(final, map_location="cpu", weights_only=False)
+        else:
+            print("No Mango checkpoint found. Train first.")
+            return
+
+    model = ActorCriticMLP(obs_dim=OBS_DIM, hidden_dim=256, num_layers=3)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    opp = load_opponent(opponent_name)
+    env = MeleeSimEnv(opponent_fn=opp, max_frames=5000)
+
+    print(f"Evaluating: Mango vs {opponent_name}\n")
+    for ep in range(num_episodes):
+        obs, info = env.reset(seed=ep)
+        total_reward = 0.0
+
+        for step in range(5000):
+            obs_t = torch.from_numpy(obs).float().unsqueeze(0)
+            with torch.no_grad():
+                logits_flat, _ = model(obs_t)
+            actions = []
+            offset = 0
+            for n in ACTION_NVEC:
+                logits = logits_flat[:, offset : offset + n]
+                a = logits.argmax(dim=-1)
+                actions.append(a.item())
+                offset += n
+            action = np.array(actions, dtype=np.int64)
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            if terminated or truncated:
+                break
+
+        metrics = info.get("episode_metrics", {})
+        winner = info.get("winner", None)
+        result = "WIN" if winner == 0 else "LOSS" if winner == 1 else "TIME"
+
+        print(f"  Episode {ep}: {result} | reward={total_reward:+.3f} "
+              f"| stocks {info['p0_stocks']}v{info['p1_stocks']} "
+              f"| dmg_dealt={metrics.get('damage_dealt', 0):.0f} "
+              f"dmg_taken={metrics.get('damage_taken', 0):.0f}")
+
+    print("\nDone.")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -910,6 +980,26 @@ def main() -> None:
         choices=("cuda", "cpu"),
         help="Device for training (default: cuda for H100)",
     )
+    parser.add_argument(
+        "--opponent",
+        type=str,
+        default=None,
+        metavar="OPPONENT",
+        help="Train vs named opponent (e.g. 'puff', or a .zip/.pt path)",
+    )
+    parser.add_argument(
+        "--eval-vs",
+        type=str,
+        default=None,
+        metavar="OPPONENT",
+        help="Evaluate latest Mango checkpoint vs named opponent",
+    )
+    parser.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=5,
+        help="Number of evaluation episodes (default: 5)",
+    )
     args = parser.parse_args()
     args.use_amp = args.use_amp and not args.no_amp
 
@@ -919,6 +1009,8 @@ def main() -> None:
         _run_stability_test()
     elif args.test:
         test_reward_logic()
+    elif args.eval_vs:
+        _evaluate_vs_opponent(args.eval_vs, args.eval_episodes)
     else:
         _train_ppo(args)
 
