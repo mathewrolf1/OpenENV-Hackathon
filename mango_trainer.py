@@ -137,6 +137,31 @@ class MangoRewardWrapper(gym.Wrapper):
 
 ACTION_NVEC = [5, 4, 2, 2, 2, 2]
 NUM_ACTIONS = sum(ACTION_NVEC)
+ACTION_FLAT = 5 * 4 * 2 * 2 * 2 * 2  # 320 — matches MeleeSimEnv Discrete(320)
+
+
+def encode_flat(action_6: torch.Tensor) -> torch.Tensor:
+    """Encode (batch, 6) multi-head action indices to (batch,) flat Discrete(320) integer.
+
+    This lets TorchRL store a scalar action in shared memory (avoiding the
+    MultiDiscrete tensor-size mismatch in ParallelEnv).
+    """
+    flat = torch.zeros(action_6.shape[:-1], dtype=torch.long, device=action_6.device)
+    multiplier = 1
+    for i in reversed(range(len(ACTION_NVEC))):
+        flat = flat + action_6[..., i].long() * multiplier
+        multiplier *= ACTION_NVEC[i]
+    return flat
+
+
+def decode_flat(flat: torch.Tensor) -> torch.Tensor:
+    """Decode (batch,) flat Discrete(320) integers to (batch, 6) action indices."""
+    indices = []
+    remaining = flat.clone().long()
+    for n in reversed(ACTION_NVEC):
+        indices.append(remaining % n)
+        remaining = remaining // n
+    return torch.stack(list(reversed(indices)), dim=-1)
 
 
 class ActorCriticMLP(nn.Module):
@@ -200,23 +225,14 @@ def _create_env(max_frames: int = 5000, opponent_fn=None) -> gym.Env:
 
 
 class _ActionConverterWrapper(gym.Wrapper):
-    """Ensures action is np.ndarray shape (6,) for MultiDiscrete (TorchRL compat)."""
+    """Pass-through wrapper kept for API compatibility.
+    MeleeSimEnv.step() now accepts flat Discrete(320) integers directly.
+    """
 
     def step(self, action):
         if hasattr(action, "cpu"):
             action = action.cpu().numpy()
-        action = np.asarray(action, dtype=np.int64)
-        if action.ndim > 1:
-            action = action.squeeze()
-        if action.ndim == 0:
-            # Flattened index from TorchRL: decode [5,4,2,2,2,2]
-            idx = int(action)
-            decoded = []
-            for n in reversed(ACTION_NVEC):
-                decoded.append(idx % n)
-                idx //= n
-            action = np.array(decoded[::-1], dtype=np.int64)
-        return self.env.step(action)
+        return self.env.step(int(np.asarray(action).flat[0]))
 
 
 def _run_sanity_rollout(max_steps: int = 2000) -> None:
@@ -349,9 +365,9 @@ def _train_ppo(args: argparse.Namespace) -> None:
     def policy_fn(td):
         with torch.no_grad():
             obs = td["observation"].float()
-            action, log_prob = model.get_action_and_log_prob(obs)
+            action_6, log_prob = model.get_action_and_log_prob(obs)
             _, value = model(obs)
-        td["action"] = action
+        td["action"] = encode_flat(action_6)
         td["sample_log_prob"] = log_prob
         td["state_value"] = value
         return td
@@ -448,7 +464,7 @@ def _train_ppo(args: argparse.Namespace) -> None:
             for _ in range(args.frames_per_batch // args.sub_batch_size):
                 sub = replay_buffer.sample(args.sub_batch_size).to(device)
                 obs_sub = sub["observation"].float()
-                action_sub = sub["action"]
+                action_sub = decode_flat(sub["action"])  # (batch, 6) from flat Discrete(320)
                 old_log_prob = sub["sample_log_prob"]
                 adv = sub["advantage"]
                 ret = sub["value_target"]
@@ -612,9 +628,9 @@ def _run_stability_test() -> None:
     def policy_fn(td):
         with torch.no_grad():
             obs = td["observation"].float()
-            action, log_prob = model.get_action_and_log_prob(obs)
+            action_6, log_prob = model.get_action_and_log_prob(obs)
             _, value = model(obs)
-        td["action"] = action
+        td["action"] = encode_flat(action_6)
         td["sample_log_prob"] = log_prob
         td["state_value"] = value
         return td
@@ -681,7 +697,7 @@ def _run_stability_test() -> None:
             for _ in range(frames_per_batch // sub_batch_size):
                 sub = replay_buffer.sample(sub_batch_size).to(device)
                 obs_sub = sub["observation"].float()
-                action_sub = sub["action"]
+                action_sub = decode_flat(sub["action"])  # (batch, 6) from flat Discrete(320)
                 old_log_prob = sub["sample_log_prob"]
                 adv = sub["advantage"]
                 ret = sub["value_target"]
@@ -883,7 +899,8 @@ def _evaluate_vs_opponent(opponent_name: str, num_episodes: int = 5) -> None:
                 a = logits.argmax(dim=-1)
                 actions.append(a.item())
                 offset += n
-            action = np.array(actions, dtype=np.int64)
+            action_6 = torch.tensor([actions], dtype=torch.long)
+            action = int(encode_flat(action_6).item())
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
             if terminated or truncated:
