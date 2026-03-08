@@ -50,6 +50,7 @@ from envs.melee_sim_env import MeleeSimEnv, OBS_DIM, _build_obs, _decode_action
 from opponents import load_opponent
 from physics.constants import Action, STAGE
 from physics.state import GameState
+from rewards.puff import PuffReward
 
 # Reuse the same network architecture as Mango
 from mango_trainer import (
@@ -58,37 +59,20 @@ from mango_trainer import (
 )
 
 
-# ---------------------------------------------------------------------------
-# PuffRewardWrapper
-# ---------------------------------------------------------------------------
-
-# Sweet-spot spacing: Puff orbits the opponent at this distance
-SPACING_IDEAL = 10.0   # units — just inside jab/bair range
-SPACING_INNER = 5.0    # too close (Rest range — reserved for Rest)
-SPACING_OUTER = 20.0   # too far — no spacing bonus
-SPACING_BONUS = 0.003  # per frame in the sweet spot
-SPACING_COEF = 0.005   # gradient toward sweet spot when outside it
-
-DAMAGE_BONUS = 0.04    # on top of base env's 0.01 -> total 0.05
-REST_KILL_BONUS = 0.5
-REST_MISS_PENALTY = 0.002  # per frame of sleep after a whiff
-
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_INTERVAL_FRAMES = 1_000_000
 
 
 class PuffRewardWrapper(gym.Wrapper):
-    """Wraps MeleeSimEnv with Puff-style weave-in/out reward shaping.
+    """Wraps MeleeSimEnv with Puff-style reward shaping via rewards.puff.PuffReward.
 
-    Puff is incentivized to orbit the opponent at jab/bair spacing (~10 units),
-    darting in to attack then backing out — rather than always running toward
-    them. Rest is still rewarded heavily when it kills.
+    Delegates all reward computation to the shared PuffReward calculator so the
+    same logic is used for both sim training and Dolphin fine-tuning.
     """
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
-        self._prev_distance: float = 20.0
-        self._prev_opp_percent: float = 0.0
+        self._reward_calc = PuffReward()
 
     def reset(
         self,
@@ -97,58 +81,27 @@ class PuffRewardWrapper(gym.Wrapper):
         options: Optional[Dict] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         obs, info = self.env.reset(seed=seed, options=options)
-        self._prev_distance = 20.0
-        self._prev_opp_percent = 0.0
+        self._reward_calc.reset()
         return obs, info
 
     def step(
         self, action: np.ndarray
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        bonus = self._compute_puff_bonus()
-        return obs, reward + bonus, terminated, truncated, info
+        obs, base_reward, terminated, truncated, info = self.env.step(action)
 
-    def _compute_puff_bonus(self) -> float:
-        bonus = 0.0
         state = getattr(self.env, "_state", None)
         if state is None:
-            return bonus
+            return obs, base_reward, terminated, truncated, info
 
         me = state.players[0]
         opp = state.players[1]
+        winner = state.winner if state.done else None
 
-        distance_now = abs(me.x - opp.x) + abs(me.y - opp.y)
-
-        # Spacing reward: bonus for orbiting at the sweet-spot distance
-        if SPACING_INNER <= distance_now <= SPACING_OUTER:
-            # Gaussian-shaped bonus peaked at SPACING_IDEAL
-            deviation = distance_now - SPACING_IDEAL
-            spacing_reward = SPACING_BONUS * math.exp(-0.5 * (deviation / 5.0) ** 2)
-            bonus += spacing_reward
-        elif distance_now > SPACING_OUTER:
-            # Too far — gradient toward sweet spot (like old approach reward)
-            distance_change = self._prev_distance - distance_now
-            bonus += distance_change * SPACING_COEF
-
-        self._prev_distance = distance_now
-
-        # Extra damage amplification (base env gives 0.01, we add 0.04 -> 0.05 total)
-        damage_dealt = opp.percent - self._prev_opp_percent
-        if damage_dealt > 0:
-            bonus += damage_dealt * DAMAGE_BONUS
-        self._prev_opp_percent = opp.percent
-
-        # Rest kill bonus (only fires the frame a stock is taken via Rest)
-        if getattr(me, "_current_move_name", "") == "rest":
-            if me.attack_connected and me.action == Action.REST_SLEEP:
-                bonus += REST_KILL_BONUS
-
-        # Missed Rest penalty (per frame of sleep after whiff)
-        if (me.action == Action.REST_SLEEP
-                and not me.attack_connected):
-            bonus -= REST_MISS_PENALTY
-
-        return bonus
+        reward, reward_info = self._reward_calc.step(
+            me, opp, done=state.done, winner=winner,
+        )
+        info.update(reward_info)
+        return obs, reward, terminated, truncated, info
 
 
 # ---------------------------------------------------------------------------
