@@ -52,7 +52,10 @@ from physics.constants import Action, STAGE
 from physics.state import GameState
 
 # Reuse the same network architecture as Mango
-from mango_trainer import ActorCriticMLP, ACTION_NVEC, NUM_ACTIONS, _ActionConverterWrapper
+from mango_trainer import (
+    ActorCriticMLP, ACTION_NVEC, NUM_ACTIONS, ACTION_FLAT,
+    encode_flat, decode_flat, _ActionConverterWrapper,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +243,7 @@ def _train_ppo(args: argparse.Namespace) -> None:
                 max_frames=args.max_frames, opponent_fn=opponent_fn
             )),
             device="cpu",
+            categorical_action_encoding=True,
         )
 
     base_env = ParallelEnv(
@@ -278,9 +282,9 @@ def _train_ppo(args: argparse.Namespace) -> None:
     def policy_fn(td):
         with torch.no_grad():
             obs = td["observation"].float()
-            action, log_prob = model.get_action_and_log_prob(obs)
+            action_6, log_prob = model.get_action_and_log_prob(obs)
             _, value = model(obs)
-        td["action"] = action
+        td["action"] = encode_flat(action_6)
         td["sample_log_prob"] = log_prob
         td["state_value"] = value
         return td
@@ -384,7 +388,7 @@ def _train_ppo(args: argparse.Namespace) -> None:
             for _ in range(args.frames_per_batch // args.sub_batch_size):
                 sub = replay_buffer.sample(args.sub_batch_size).to(device)
                 obs_sub = sub["observation"].float()
-                action_sub = sub["action"]
+                action_sub = decode_flat(sub["action"])  # (batch, 6) from flat Discrete(320)
                 old_log_prob = sub["sample_log_prob"]
                 adv = sub["advantage"]
                 ret = sub["value_target"]
@@ -502,6 +506,7 @@ def _run_stability_test() -> None:
     base_env = GymWrapper(
         _ActionConverterWrapper(_create_env(max_frames=3000)),
         device=device,
+        categorical_action_encoding=True,
     )
 
     model = ActorCriticMLP(obs_dim=OBS_DIM, hidden_dim=128, num_layers=2).to(device)
@@ -509,9 +514,9 @@ def _run_stability_test() -> None:
     def policy_fn(td):
         with torch.no_grad():
             obs = td["observation"].float()
-            action, log_prob = model.get_action_and_log_prob(obs)
+            action_6, log_prob = model.get_action_and_log_prob(obs)
             _, value = model(obs)
-        td["action"] = action
+        td["action"] = encode_flat(action_6)
         td["sample_log_prob"] = log_prob
         td["state_value"] = value
         return td
@@ -564,13 +569,14 @@ def _run_stability_test() -> None:
             replay_buffer.extend(data_view.cpu())
             for _ in range(frames_per_batch // sub_batch_size):
                 sub = replay_buffer.sample(sub_batch_size).to(device)
+                action_sub = decode_flat(sub["action"])  # (batch, 6) from flat Discrete(320)
                 logits_flat, value = model(sub["observation"].float())
                 offset = 0
                 log_prob = 0.0
                 for j, nv in enumerate(ACTION_NVEC):
                     logits = logits_flat[:, offset : offset + nv]
                     dist = torch.distributions.Categorical(logits=logits)
-                    a = sub["action"][..., j].long().clamp(0, nv - 1)
+                    a = action_sub[..., j].long().clamp(0, nv - 1)
                     log_prob = log_prob + dist.log_prob(a)
                     offset += nv
                 ratio = torch.exp(log_prob - sub["sample_log_prob"])
@@ -650,7 +656,8 @@ def _evaluate(opponent_name: Optional[str], num_episodes: int = 5) -> None:
                 a = logits.argmax(dim=-1)
                 actions.append(a.item())
                 offset += n
-            action = np.array(actions, dtype=np.int64)
+            action_6 = torch.tensor([actions], dtype=torch.long)
+            action = int(encode_flat(action_6).item())
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
             if terminated or truncated:

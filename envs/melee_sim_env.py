@@ -62,13 +62,34 @@ def _build_obs(gs: GameState, player_idx: int) -> np.ndarray:
 STICK_X_BINS = [-1.0, -0.6, 0.0, 0.6, 1.0]
 STICK_Y_BINS = [-1.0, 0.0, 0.5, 1.0]
 
+# Action factorisation: [stick_x, stick_y, jump, attack, grab, special]
+ACTION_NVEC = [5, 4, 2, 2, 2, 2]
+ACTION_FLAT = 5 * 4 * 2 * 2 * 2 * 2  # 320 — used for Discrete action space
+
 
 def _decode_action(action: np.ndarray) -> Dict:
-    """Convert MultiDiscrete action array to simulator dict."""
+    """Convert 6-element action index array to simulator dict (used by opponents)."""
     sx_idx, sy_idx, jump, attack, grab, special = (
         int(action[0]), int(action[1]), int(action[2]),
         int(action[3]), int(action[4]), int(action[5]),
     )
+    return {
+        "stick_x": STICK_X_BINS[sx_idx],
+        "stick_y": STICK_Y_BINS[sy_idx],
+        "jump": bool(jump),
+        "attack": bool(attack),
+        "grab": bool(grab),
+        "special": bool(special),
+    }
+
+
+def _decode_flat_action(idx: int) -> Dict:
+    """Decode a flat Discrete(320) integer to a simulator action dict."""
+    indices = []
+    for n in reversed(ACTION_NVEC):
+        indices.append(idx % n)
+        idx //= n
+    sx_idx, sy_idx, jump, attack, grab, special = reversed(indices)
     return {
         "stick_x": STICK_X_BINS[sx_idx],
         "stick_y": STICK_Y_BINS[sy_idx],
@@ -89,8 +110,9 @@ class MeleeSimEnv(gym.Env):
     controlled by ``opponent_fn`` (defaults to a standing dummy).
 
     Observation: float32 vector of length ``OBS_DIM``.
-    Action: MultiDiscrete([5, 4, 2, 2, 2, 2]) —
-        stick_x (5 bins), stick_y (4 bins), jump, attack, grab, special.
+    Action: Discrete(320) — flat encoding of [stick_x(5), stick_y(4), jump, attack, grab, special].
+        Use _decode_flat_action() to inspect; _decode_action() still works for 6-element arrays
+        (used by opponent loaders).
     """
 
     metadata = {"render_modes": []}
@@ -109,14 +131,9 @@ class MeleeSimEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-5.0, high=5.0, shape=(OBS_DIM,), dtype=np.float32
         )
-        self.action_space = spaces.MultiDiscrete([
-            len(STICK_X_BINS),  # stick_x
-            len(STICK_Y_BINS),  # stick_y
-            2,                  # jump
-            2,                  # attack
-            2,                  # grab
-            2,                  # special (down+special = Rest)
-        ])
+        # Flat Discrete(320) so TorchRL ParallelEnv shared-memory works correctly.
+        # The 320 actions encode [stick_x(5) × stick_y(4) × jump(2) × attack(2) × grab(2) × special(2)].
+        self.action_space = spaces.Discrete(ACTION_FLAT)
 
         self._state: Optional[GameState] = None
         self._prev_percent_self: float = 0.0
@@ -159,9 +176,13 @@ class MeleeSimEnv(gym.Env):
         return obs, {}
 
     def step(
-        self, action: np.ndarray
+        self, action
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        agent_action = _decode_action(action)
+        # Accept flat int (Discrete(320)) or numpy/tensor scalar
+        if hasattr(action, "cpu"):
+            action = action.cpu().numpy()
+        flat_idx = int(np.asarray(action).flat[0])
+        agent_action = _decode_flat_action(flat_idx)
         opp_action = self.opponent_fn(self._state, 1)
 
         prev_opp_stocks = self._state.players[1].stock
@@ -172,7 +193,7 @@ class MeleeSimEnv(gym.Env):
         me = self._state.players[0]
         opp = self._state.players[1]
 
-        if agent_action["special"] and agent_action["stick_y"] < -0.3:
+        if agent_action.get("special") and agent_action.get("stick_y", 0.0) < -0.3:
             self._ep_rest_attempts += 1
         if (me.action == Action.REST_SLEEP and me.attack_connected
                 and getattr(me, "_current_move_name", "") == "rest"
