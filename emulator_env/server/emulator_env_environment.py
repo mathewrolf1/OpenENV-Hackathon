@@ -7,14 +7,17 @@ It inherits from `openenv.core.env_server.interfaces.Environment` and defines:
 * `state` property – returns the current session state.
 * `close()` – shuts down the Dolphin process.
 
-Port 1: Fox (agent), controlled by client — for Dolphin training (e.g. MeleeTorchEnv).
-Port 2: Jigglypuff (opponent), controlled by puff_final.pt on the server.
+Port 1: RL agent, controlled by client (dolphin_train.py).
+Port 2: Opponent — CPU AI or frozen policy on the server.
 
 Environment variables:
     DOLPHIN_PATH         – (required) directory containing the Slippi Dolphin executable.
     ISO_PATH             – (optional) path to the Melee ISO file.
     DOLPHIN_HOME         – (optional) path to the Dolphin user/home directory.
-    PUFF_CHECKPOINT_PATH – (optional) path to puff policy for P2. Default: checkpoints/puff_final.pt
+    P1_CHARACTER         – (optional) character for port 1 / agent. Default: JIGGLYPUFF.
+    P2_CHARACTER         – (optional) character for port 2 / opponent. Default: FOX.
+    CPU_LEVEL            – 0 = P2 driven by model checkpoint; >0 = Dolphin CPU AI at that level.
+    P2_CHECKPOINT_PATH   – (optional) path to opponent model for P2. Default: checkpoints/mango_final.pt
     TRAINING_MODE        – "NORMAL" (default) or "RECOVERY". If RECOVERY, each reset runs a short
                            scripted phase to spawn agent off-stage and opponent center for recovery training.
 """
@@ -105,10 +108,11 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         self._prev_opponent_damage: float = 0.0
         self._prev_opponent_stocks: int = 4
 
-        # P2 puff policy (port 2 = Jigglypuff)
+        # P2 opponent policy
         self._p2_model = None
         self._last_gamestate = None
         self._training_mode = (os.environ.get("TRAINING_MODE", "NORMAL") or "NORMAL").strip().upper()
+        self._first_match_started = False  # True once the first match begins
 
         try:
             self._init_emulator()
@@ -167,35 +171,47 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
 
         # Player 1 – the RL agent.
         self.controller = Controller(self.console, port=1)
-        # Player 2 – CPU opponent.
+        # Player 2 – always created (needed to select character + CPU level
+        # in the CSS). During gameplay we release_all() so CPU AI takes over.
         self.cpu_controller = Controller(self.console, port=2)
 
-        # Menu navigation helper – must be instantiated once and reused.
+        # Menu navigation helpers.
         self.menu_helper = melee.MenuHelper()
         self.cpu_menu_helper = melee.MenuHelper()
 
-        # Configurable match parameters (Dolphin training: P1 Fox, P2 Puff).
-        # Port 1: Fox (agent) – client sends actions (e.g. MeleeTorchEnv / train_emulator).
-        # Port 2: Jigglypuff (opponent) – controlled by puff policy on server.
-        self._character = melee.Character.FOX
-        self._cpu_character = melee.Character.JIGGLYPUFF
+        # Characters are configurable via P1_CHARACTER / P2_CHARACTER env vars.
+        # Defaults: P1=JIGGLYPUFF (agent), P2=FOX (opponent).
+        p1_char_name = os.environ.get("P1_CHARACTER", "JIGGLYPUFF").strip().upper()
+        p2_char_name = os.environ.get("P2_CHARACTER", "FOX").strip().upper()
+        self._character = getattr(melee.Character, p1_char_name, melee.Character.JIGGLYPUFF)
+        self._cpu_character = getattr(melee.Character, p2_char_name, melee.Character.FOX)
         self._stage = melee.Stage.FINAL_DESTINATION
-        self._cpu_level = 0  # P2 driven by puff policy, not CPU
+        log.info("P1 (agent): %s | P2 (opponent): %s", p1_char_name, p2_char_name)
 
-        # Load puff policy for P2 (Jigglypuff)
-        puff_path = os.environ.get(
-            "PUFF_CHECKPOINT_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints", "puff_final.pt"),
-        )
-        if os.path.isfile(puff_path):
-            self._p2_model = load_model(puff_path, device="cpu")
-            log.info("P2 (Jigglypuff) controlled by puff model from %s", puff_path)
+        # CPU_LEVEL: if > 0, use Dolphin's built-in CPU AI at that level (e.g. 9).
+        # If 0 (default), P2 is driven by a model checkpoint.
+        cpu_level_env = os.environ.get("CPU_LEVEL", "0").strip()
+        try:
+            self._cpu_level = int(cpu_level_env)
+        except ValueError:
+            self._cpu_level = 0
+
+        if self._cpu_level > 0:
+            log.info("P2 (%s) CPU level %d", p2_char_name, self._cpu_level)
         else:
-            log.warning(
-                "Puff model not found at %s – P2 will hold neutral. "
-                "Set PUFF_CHECKPOINT_PATH or place puff_final.pt in checkpoints/.",
-                puff_path,
+            p2_ckpt_path = os.environ.get(
+                "P2_CHECKPOINT_PATH",
+                os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints", "mango_final.pt"),
             )
+            if os.path.isfile(p2_ckpt_path):
+                self._p2_model = load_model(p2_ckpt_path, device="cpu")
+                log.info("P2 (%s) controlled by model from %s", p2_char_name, p2_ckpt_path)
+            else:
+                log.warning(
+                    "P2 model not found at %s – P2 will hold neutral. "
+                    "Set P2_CHECKPOINT_PATH or place the checkpoint in checkpoints/.",
+                    p2_ckpt_path,
+                )
 
         # Launch the emulator process.
         log.info("Launching Dolphin from %s ...", dolphin_path)
@@ -211,11 +227,10 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
             )
         log.info("Dolphin connected.")
 
-        # Plug in both controllers.
         log.info("Connecting controllers ...")
         self.controller.connect()
         self.cpu_controller.connect()
-        log.info("Controllers connected (port 1 + port 2 CPU).")
+        log.info("Controllers connected (port 1 + port 2).")
 
         self._connected = True
 
@@ -257,11 +272,11 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         self._prev_opponent_damage = 0.0
         self._prev_opponent_stocks = 4
 
-        # Re-create menu helpers so internal state is clean for a new episode.
+        log.info("reset(): navigating menus to start a new match ...")
+
+        # Fresh helpers so stage_selected / name_tag_index don't carry over.
         self.menu_helper = melee.MenuHelper()
         self.cpu_menu_helper = melee.MenuHelper()
-
-        log.info("reset(): navigating menus to start a new match ...")
 
         for frame_idx in range(_MAX_MENU_FRAMES):
             gamestate = self.console.step()
@@ -273,35 +288,61 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
                 melee.Menu.SUDDEN_DEATH,
             ):
                 log.info("reset(): match started after %d menu frames.", frame_idx)
+                self._first_match_started = True
                 self._last_gamestate = gamestate
-                # Curriculum: RECOVERY mode — scripted phase to put P1 off-stage, P2 center
                 if use_recovery:
                     gamestate = self._run_recovery_setup(gamestate, frame_idx)
                     self._last_gamestate = gamestate
                 return self._make_observation(gamestate, reward=0.0, done=False)
 
-            # Let MenuHelper drive inputs for both controllers.
+            # ---- P2 ----
+            if self._cpu_level > 0 and not self._first_match_started:
+                # First match only: P2 helper picks Fox + CPU level 9.
+                self.cpu_menu_helper.menu_helper_simple(
+                    gamestate=gamestate,
+                    controller=self.cpu_controller,
+                    character_selected=self._cpu_character,
+                    stage_selected=self._stage,
+                    connect_code="",
+                    cpu_level=self._cpu_level,
+                    costume=0,
+                    autostart=False,
+                    swag=False,
+                    frozen_stadium=False,
+                )
+            else:
+                # Subsequent matches (CPU persists) or model-driven: hands off.
+                self.cpu_controller.release_all()
+
+            # ---- P1 ----
+            # On the first match's CSS, hold autostart until P2 finishes
+            # toggling to CPU level 9. Everywhere else, autostart=True so
+            # libmelee instantly selects Puff → FD → go.
+            p1_autostart = True
+            if (
+                self._cpu_level > 0
+                and not self._first_match_started
+                and gamestate.menu_state == melee.enums.Menu.CHARACTER_SELECT
+            ):
+                p2 = gamestate.players.get(2)
+                if p2 is None or (
+                    p2.controller_status != melee.enums.ControllerStatus.CONTROLLER_CPU
+                    or p2.cpu_level != self._cpu_level
+                    or not p2.coin_down
+                ):
+                    p1_autostart = False
+
             self.menu_helper.menu_helper_simple(
                 gamestate=gamestate,
                 controller=self.controller,
                 character_selected=self._character,
                 stage_selected=self._stage,
                 connect_code="",
-                cpu_level=0,  # 0 = bot/human controlled (our RL agent)
+                cpu_level=0,
                 costume=0,
-                autostart=True,
+                autostart=p1_autostart,
                 swag=False,
-            )
-            self.cpu_menu_helper.menu_helper_simple(
-                gamestate=gamestate,
-                controller=self.cpu_controller,
-                character_selected=self._cpu_character,
-                stage_selected=self._stage,
-                connect_code="",
-                cpu_level=self._cpu_level,
-                costume=0,
-                autostart=False,  # only one controller should autostart
-                swag=False,
+                frozen_stadium=False,
             )
 
         # If we never reached IN_GAME, return a placeholder.
@@ -334,11 +375,8 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
                 self.controller.tilt_analog_unit(Button.BUTTON_C, 0.0, 0.0)
                 for btn in (Button.BUTTON_A, Button.BUTTON_B, Button.BUTTON_Y, Button.BUTTON_Z, Button.BUTTON_L, Button.BUTTON_R):
                     self.controller.release_button(btn)
-            # P2: neutral
-            self.cpu_controller.tilt_analog_unit(Button.BUTTON_MAIN, 0.0, 0.0)
-            self.cpu_controller.tilt_analog_unit(Button.BUTTON_C, 0.0, 0.0)
-            for btn in (Button.BUTTON_A, Button.BUTTON_B, Button.BUTTON_X, Button.BUTTON_Y, Button.BUTTON_Z, Button.BUTTON_L, Button.BUTTON_R):
-                self.cpu_controller.release_button(btn)
+            # P2: release all during recovery setup
+            self.cpu_controller.release_all()
             gamestate = self.console.step()
             self._last_gamestate = gamestate
             if gamestate is not None and gamestate.menu_state == melee.Menu.POSTGAME_SCORES:
@@ -385,8 +423,11 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
             else:
                 self.controller.release_button(button)
 
-        # P2 (Puff): apply puff policy action before stepping (never use CPU AI)
-        if self._last_gamestate is not None:
+        # P2: if CPU mode, release all inputs so Dolphin's internal CPU AI drives.
+        # If model mode, run the model policy via the P2 controller.
+        if self._cpu_level > 0:
+            self.cpu_controller.release_all()
+        elif self._last_gamestate is not None:
             if self._p2_model is not None:
                 obs_p2 = self._make_observation(self._last_gamestate, done=False)
                 obs_vec = obs_to_vector(obs_p2, player_idx=1)  # P2 perspective
@@ -409,6 +450,7 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
                     self.cpu_controller.press_button(button)
                 else:
                     self.cpu_controller.release_button(button)
+        # If self._cpu_level > 0, Dolphin's built-in CPU AI controls P2 automatically.
 
         # Advance the emulator one frame and fetch the new gamestate.
         prev_gamestate = self._last_gamestate  # for action-clipping reward (pre-step state)
@@ -663,14 +705,14 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
             player_x=p1_x,
             player_y=p1_y,
             player_damage=int(p1.percent) if p1 else 0,
-            player_action_state=p1.action.name if p1 else "unknown",
+            player_action_state=getattr(p1.action, "name", str(p1.action)) if p1 else "unknown",
             player_stocks=int(p1.stock) if p1 else 0,
             **phys1,
             # Player 2 (positions normalized by blastzones)
             opponent_x=p2_x,
             opponent_y=p2_y,
             opponent_damage=int(p2.percent) if p2 else 0,
-            opponent_action_state=p2.action.name if p2 else "unknown",
+            opponent_action_state=getattr(p2.action, "name", str(p2.action)) if p2 else "unknown",
             opponent_stocks=int(p2.stock) if p2 else 0,
             **phys2,
             # General

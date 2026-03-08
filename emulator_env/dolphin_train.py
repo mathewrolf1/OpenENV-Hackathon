@@ -106,10 +106,14 @@ class _ObsProxy:
         if name == "attack_connected":
             return False
         if name == "off_stage":
+            # player_x is normalized by FD_HALF_WIDTH_X (224.0); stage edge
+            # is at ±68.4 raw units → ±0.305 normalized.
             x = getattr(self._obs, f"{self._prefix}_x", 0.0)
-            return abs(x) > 68.4
+            return abs(x) > 0.305
         if name == "jumps_left":
-            return 5
+            # SmashObservation does not expose jumps_left; return a sentinel
+            # so recovery logic in puff.py can still use it for the sim.
+            return getattr(self._obs, f"{self._prefix}_jumps_left", -1)
         return 0
 
 
