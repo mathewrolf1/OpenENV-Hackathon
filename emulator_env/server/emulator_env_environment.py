@@ -7,11 +7,14 @@ It inherits from `openenv.core.env_server.interfaces.Environment` and defines:
 * `state` property – returns the current session state.
 * `close()` – shuts down the Dolphin process.
 
+Port 1: Jigglypuff, controlled by client (jiggly.pt via train_emulator.py).
+Port 2: Fox (Mango), controlled by mango.pt policy on the server.
+
 Environment variables:
-    DOLPHIN_PATH  – (required) directory containing the Slippi Dolphin executable.
-    ISO_PATH      – (optional) path to the Melee ISO file.
-    DOLPHIN_HOME  – (optional) path to the Dolphin user/home directory.
-                    If not set, libmelee creates a temporary directory.
+    DOLPHIN_PATH         – (required) directory containing the Slippi Dolphin executable.
+    ISO_PATH             – (optional) path to the Melee ISO file.
+    DOLPHIN_HOME         – (optional) path to the Dolphin user/home directory.
+    MANGO_CHECKPOINT_PATH – (optional) path to mango.pt for P2. Default: checkpoints/mango.pt
 """
 
 import os
@@ -44,6 +47,12 @@ from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
 
 from ..models import SmashAction, SmashObservation
+from ..policy_runner import (
+    action_to_smash,
+    get_action,
+    load_model,
+    obs_to_vector,
+)
 
 import melee
 from melee import Console, Controller, Button
@@ -71,6 +80,10 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         self._prev_player_damage: float = 0.0
         self._prev_opponent_damage: float = 0.0
         self._prev_opponent_stocks: int = 4
+
+        # P2 mango.pt policy (port 2 = Fox)
+        self._mango_model = None
+        self._last_gamestate = None
 
         try:
             self._init_emulator()
@@ -137,10 +150,28 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         self.cpu_menu_helper = melee.MenuHelper()
 
         # Configurable match parameters (can be exposed later).
+        # Port 1: Jigglypuff (client sends actions from puff_final.pt)
+        # Port 2: Fox (Mango) – controlled by mango model, never CPU
         self._character = melee.Character.JIGGLYPUFF
-        self._cpu_character = melee.Character.FALCO
+        self._cpu_character = melee.Character.FOX
         self._stage = melee.Stage.FINAL_DESTINATION
-        self._cpu_level = 3  # CPU difficulty 1-9
+        # P2 is always human-controlled (cpu_level=0) so we drive it with mango model
+        self._cpu_level = 0
+
+        # Load mango model for P2 (required – no CPU fallback)
+        mango_path = os.environ.get(
+            "MANGO_CHECKPOINT_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints", "mango_final.pt"),
+        )
+        if os.path.isfile(mango_path):
+            self._mango_model = load_model(mango_path, device="cpu")
+            log.info("P2 (Fox) controlled by mango model from %s", mango_path)
+        else:
+            log.warning(
+                "Mango model not found at %s – P2 will hold neutral. "
+                "Set MANGO_CHECKPOINT_PATH or place mango_final.pt in checkpoints/.",
+                mango_path,
+            )
 
         # Launch the emulator process.
         log.info("Launching Dolphin from %s ...", dolphin_path)
@@ -210,6 +241,7 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
                 melee.Menu.SUDDEN_DEATH,
             ):
                 log.info("reset(): match started after %d menu frames.", frame_idx)
+                self._last_gamestate = gamestate
                 return self._make_observation(gamestate, reward=0.0, done=False)
 
             # Let MenuHelper drive inputs for both controllers.
@@ -239,6 +271,7 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         # If we never reached IN_GAME, return a placeholder.
         log.warning("reset(): timed out waiting for match to start!")
         gamestate = self.console.step()
+        self._last_gamestate = gamestate
         return self._make_observation(gamestate, reward=0.0, done=False)
 
     # ------------------------------------------------------------------
@@ -280,8 +313,34 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
             else:
                 self.controller.release_button(button)
 
+        # P2 (Fox): apply mango model action before stepping (never use CPU AI)
+        if self._last_gamestate is not None:
+            if self._mango_model is not None:
+                obs_p2 = self._make_observation(self._last_gamestate, done=False)
+                obs_vec = obs_to_vector(obs_p2, player_idx=1)  # P2 perspective
+                action_indices = get_action(self._mango_model, obs_vec, deterministic=True)
+                smash_p2 = action_to_smash(action_indices)
+            else:
+                smash_p2 = SmashAction()  # neutral when model not loaded
+            self.cpu_controller.tilt_analog_unit(Button.BUTTON_MAIN, smash_p2.stick_x, smash_p2.stick_y)
+            self.cpu_controller.tilt_analog_unit(Button.BUTTON_C, smash_p2.c_stick_x, smash_p2.c_stick_y)
+            for pressed, button in (
+                (smash_p2.button_a, Button.BUTTON_A),
+                (smash_p2.button_b, Button.BUTTON_B),
+                (smash_p2.button_x, Button.BUTTON_X),
+                (smash_p2.button_y, Button.BUTTON_Y),
+                (smash_p2.button_z, Button.BUTTON_Z),
+                (smash_p2.button_l, Button.BUTTON_L),
+                (smash_p2.button_r, Button.BUTTON_R),
+            ):
+                if pressed:
+                    self.cpu_controller.press_button(button)
+                else:
+                    self.cpu_controller.release_button(button)
+
         # Advance the emulator one frame and fetch the new gamestate.
         gamestate = self.console.step()
+        self._last_gamestate = gamestate
 
         # Determine whether the match ended.
         done = (

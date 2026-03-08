@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""Run a trained Puff model against real Melee via the OpenEnv emulator bridge.
+"""Run jiggly.pt (P1 Jigglypuff) against mango.pt (P2 Fox) via the OpenEnv emulator.
 
-Loads a checkpoint (default: ../checkpoints/puff_final.pt), connects to the
-emulator server over WebSocket, and runs inference-only evaluation episodes.
-
-The script bridges two incompatible interfaces:
-  - Sim model: 26-dim float32 observation, MultiDiscrete([5,4,2,2,2,2]) action
-  - Emulator:  SmashObservation (Pydantic), SmashAction (GameCube controller)
-
-Translation layers handle the conversion in both directions.
+Port 1: Jigglypuff, controlled by this client using jiggly.pt.
+Port 2: Fox (Mango), controlled by mango.pt on the server.
 
 Prerequisites:
     1. Install dependencies (once):
@@ -22,8 +16,7 @@ Prerequisites:
     3. Run this script:
            cd emulator_env
            uv run python train_emulator.py
-           uv run python train_emulator.py --checkpoint ../checkpoints/puff_final.pt
-           uv run python train_emulator.py --server-url http://remote-host:8000
+           uv run python train_emulator.py --checkpoint ../checkpoints/jiggly.pt
            uv run python train_emulator.py --deterministic --num-episodes 5
 """
 
@@ -35,375 +28,22 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from enum import IntEnum
-from typing import Dict, List
-
-import numpy as np
-import torch
-import torch.nn as nn
 
 from emulator_env import EmulatorEnv
 from emulator_env.models import SmashAction, SmashObservation
+from emulator_env.policy_runner import (
+    ActorCriticMLP,
+    action_to_smash,
+    get_action,
+    load_model,
+    obs_to_vector,
+)
 
 log = logging.getLogger(__name__)
 
 
 # ===================================================================
-# INLINED CONSTANTS  (from physics/constants.py and envs/melee_sim_env.py)
-#
-# These are copied here so the script can run inside the emulator_env
-# venv without needing gymnasium or the project-root packages.
-# Keep in sync if the sim's observation format ever changes.
-# ===================================================================
-
-
-class Action(IntEnum):
-    """Sim action states (mirrors physics.constants.Action)."""
-
-    IDLE = 0
-    WALK = 1
-    RUN = 2
-    JUMPSQUAT = 3
-    AIRBORNE = 4
-    LANDING = 5
-
-    ATTACK_STARTUP = 10
-    ATTACK_ACTIVE = 11
-    ATTACK_ENDLAG = 12
-
-    GRAB_STARTUP = 13
-    GRAB_ACTIVE = 14
-    GRAB_ENDLAG = 15
-    GRABBED = 16
-    THROW = 17
-
-    HITSTUN = 20
-    TUMBLE = 21
-
-    REST_SLEEP = 25
-
-    DEAD = 30
-    RESPAWN_INVULN = 31
-
-    NUM_ACTIONS = 32  # sentinel for observation encoding
-
-
-# Observation: 13 features per player, 2 players = 26
-OBS_DIM = 26
-
-# Discrete stick bins (must match envs/melee_sim_env.py)
-STICK_X_BINS = [-1.0, -0.6, 0.0, 0.6, 1.0]
-STICK_Y_BINS = [-1.0, 0.0, 0.5, 1.0]
-
-# Action head sizes
-ACTION_NVEC = [5, 4, 2, 2, 2, 2]
-NUM_ACTIONS_FLAT = sum(ACTION_NVEC)
-
-
-# ===================================================================
-# 1. ACTION STATE MAPPING  (libmelee string -> sim Action IntEnum)
-# ===================================================================
-
-_ACTION_STATE_MAP: Dict[str, int] = {}
-
-
-def _register(sim_action: int, *prefixes: str) -> None:
-    """Register multiple libmelee name prefixes to one sim Action."""
-    for p in prefixes:
-        _ACTION_STATE_MAP[p] = sim_action
-
-
-# Ground neutral
-_register(
-    Action.IDLE,
-    "STANDING",
-    "WAIT",
-    "TURNING",
-    "TURNING_RUN",
-    "CROUCH",
-    "CROUCHING",
-    "SQUAT",
-    "EDGE",
-    "CLIFF",
-    "TECH",
-    "NEUTRAL_GET_UP",
-    "GROUND_GET_UP",
-    "PLATFORM_DROP",
-    "SHIELD",
-    "GUARD",
-    "ESCAPE",
-    "ROLL",
-    "SPOT_DODGE",
-)
-
-# Locomotion
-_register(Action.WALK, "WALK", "SLOW_WALK")
-_register(Action.RUN, "RUNNING", "RUN", "DASH", "DASHING")
-
-# Aerial states
-_register(Action.JUMPSQUAT, "KNEE_BEND")
-_register(
-    Action.AIRBORNE,
-    "JUMPING",
-    "JUMP",
-    "FALL",
-    "AERIAL",
-    "FALLING",
-    "DOUBLE_JUMP",
-    "WALL_JUMP",
-    "MIDAIR",
-    "PASS",
-)
-_register(Action.LANDING, "LANDING", "LAND")
-
-# Attacks -- mapped to ATTACK_ACTIVE (we can't tell startup vs endlag
-# from the state string alone)
-_register(
-    Action.ATTACK_ACTIVE,
-    "ATTACK",
-    "NEUTRAL_B",
-    "SIDE_B",
-    "DOWN_B",
-    "UP_B",
-    "FSMASH",
-    "DSMASH",
-    "USMASH",
-    "JAB",
-    "FTILT",
-    "DTILT",
-    "UTILT",
-    "NAIR",
-    "FAIR",
-    "BAIR",
-    "DAIR",
-    "UAIR",
-    "SWORD_DANCE",
-    "SMASH",
-    "LOOPING_ATTACK",
-    "GETUP_ATTACK",
-    "EDGE_ATTACK",
-    "NEUTRAL_SPECIAL",
-    "SIDE_SPECIAL",
-    "DOWN_SPECIAL",
-    "UP_SPECIAL",
-    "SING",
-    "REST",
-    "ROLLOUT",
-    "POUND",
-)
-
-# Grab / throw
-_register(Action.GRAB_STARTUP, "GRAB_PULLING", "GRAB_RUNNING", "GRAB_WAIT")
-_register(Action.GRAB_ACTIVE, "GRAB", "CATCH", "GRABBING")
-_register(Action.GRAB_ENDLAG, "GRAB_PUMMEL")
-_register(Action.GRABBED, "CAPTURED", "GRAB_PUMMELED")
-_register(
-    Action.THROW,
-    "THROW",
-    "FORWARD_THROW",
-    "BACK_THROW",
-    "UP_THROW",
-    "DOWN_THROW",
-)
-
-# Hitstun / tumble
-_register(Action.HITSTUN, "DAMAGE", "KNOCKBACK", "FLYING_BACK", "THROWN")
-_register(Action.TUMBLE, "TUMBLING", "TUMBLE")
-
-# Rest sleep (Puff-specific endlag)
-_register(Action.REST_SLEEP, "REST_WAIT", "FURA_SLEEP")
-
-# Dead / respawn
-_register(Action.DEAD, "DEAD", "DYING", "ON_HALO", "WAIT_HALO")
-_register(Action.RESPAWN_INVULN, "REBIRTH", "ENTRY", "REBORN")
-
-
-def map_action_state(state_str: str) -> int:
-    """Map a libmelee action state string to a sim Action int.
-
-    Tries exact match first, then prefix match.
-    Falls back to IDLE for unknown states.
-    """
-    upper = state_str.upper()
-
-    # Exact match
-    if upper in _ACTION_STATE_MAP:
-        return _ACTION_STATE_MAP[upper]
-
-    # Prefix match (e.g. "WALK_SLOW" -> WALK, "DASH_ATTACK" -> DASH)
-    for prefix, action in _ACTION_STATE_MAP.items():
-        if upper.startswith(prefix):
-            return action
-
-    return Action.IDLE
-
-
-# ===================================================================
-# 2. OBSERVATION ADAPTER  (SmashObservation -> 26-dim float32 vector)
-# ===================================================================
-
-
-def obs_to_vector(obs: SmashObservation) -> np.ndarray:
-    """Convert a SmashObservation into the same 26-dim normalized vector
-    that the sim's _build_obs() produces.
-
-    Per-player features (13 each, agent then opponent):
-        x/100, y/100,
-        speed_x_self/5, speed_y_self/5,
-        speed_x_attack/5, speed_y_attack/5,
-        percent/200, stocks/4,
-        on_ground, facing_right,
-        action_enum/32, action_frame/60,
-        hitstun/60
-
-    Approximations:
-    - Emulator combines self+attack velocity; we use total as self, zero attack.
-    - action_frame not exposed by SmashObservation; defaults to 0.
-    """
-    player_action = map_action_state(obs.player_action_state)
-    opp_action = map_action_state(obs.opponent_action_state)
-
-    player_vec = np.array(
-        [
-            obs.player_x / 100.0,
-            obs.player_y / 100.0,
-            obs.player_speed_x / 5.0,
-            obs.player_speed_y / 5.0,
-            0.0,  # attack vel x (not split)
-            0.0,  # attack vel y
-            obs.player_damage / 200.0,
-            obs.player_stocks / 4.0,
-            float(obs.player_on_ground),
-            float(obs.player_facing_right),
-            float(player_action) / float(Action.NUM_ACTIONS),
-            0.0,  # action_frame (unavailable)
-            obs.player_hitstun_left / 60.0,
-        ],
-        dtype=np.float32,
-    )
-
-    opp_vec = np.array(
-        [
-            obs.opponent_x / 100.0,
-            obs.opponent_y / 100.0,
-            obs.opponent_speed_x / 5.0,
-            obs.opponent_speed_y / 5.0,
-            0.0,
-            0.0,
-            obs.opponent_damage / 200.0,
-            obs.opponent_stocks / 4.0,
-            float(obs.opponent_on_ground),
-            float(obs.opponent_facing_right),
-            float(opp_action) / float(Action.NUM_ACTIONS),
-            0.0,
-            obs.opponent_hitstun_left / 60.0,
-        ],
-        dtype=np.float32,
-    )
-
-    return np.concatenate([player_vec, opp_vec])
-
-
-# ===================================================================
-# 3. ACTION ADAPTER  (MultiDiscrete[6] -> SmashAction)
-# ===================================================================
-
-
-def action_to_smash(action_indices: np.ndarray) -> SmashAction:
-    """Convert a MultiDiscrete([5,4,2,2,2,2]) action array to a SmashAction.
-
-    Mapping:
-        [0] stick_x index -> STICK_X_BINS  -> stick_x
-        [1] stick_y index -> STICK_Y_BINS  -> stick_y
-        [2] jump    (0/1)                  -> button_x
-        [3] attack  (0/1)                  -> button_a
-        [4] grab    (0/1)                  -> button_z
-        [5] special (0/1)                  -> button_b
-    """
-    return SmashAction(
-        stick_x=STICK_X_BINS[int(action_indices[0])],
-        stick_y=STICK_Y_BINS[int(action_indices[1])],
-        c_stick_x=0.0,
-        c_stick_y=0.0,
-        button_a=bool(action_indices[3]),  # attack
-        button_b=bool(action_indices[5]),  # special
-        button_x=bool(action_indices[2]),  # jump
-        button_y=False,
-        button_z=bool(action_indices[4]),  # grab
-        button_l=False,
-        button_r=False,
-    )
-
-
-# ===================================================================
-# 4. MODEL  (self-contained ActorCriticMLP -- no project-root imports)
-# ===================================================================
-
-
-class ActorCriticMLP(nn.Module):
-    """Inference-only mirror of mango_trainer.ActorCriticMLP."""
-
-    def __init__(
-        self,
-        obs_dim: int = OBS_DIM,
-        hidden_dim: int = 256,
-        num_layers: int = 3,
-    ):
-        super().__init__()
-        self.action_nvec = tuple(ACTION_NVEC)
-        layers: list[nn.Module] = []
-        in_dim = obs_dim
-        for _ in range(num_layers):
-            layers.extend([nn.Linear(in_dim, hidden_dim), nn.Tanh()])
-            in_dim = hidden_dim
-        self.backbone = nn.Sequential(*layers)
-        self.actor_head = nn.Linear(hidden_dim, NUM_ACTIONS_FLAT)
-        self.critic_head = nn.Linear(hidden_dim, 1)
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(obs)
-        return self.actor_head(features)
-
-
-def load_model(checkpoint_path: str, device: str = "cpu") -> ActorCriticMLP:
-    """Load a .pt checkpoint into the ActorCriticMLP model."""
-    model = ActorCriticMLP(obs_dim=OBS_DIM)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    total_frames = ckpt.get("total_frames", "unknown")
-    log.info(
-        "Loaded checkpoint: %s (trained for %s frames)", checkpoint_path, total_frames
-    )
-    return model
-
-
-@torch.no_grad()
-def get_action(
-    model: ActorCriticMLP,
-    obs_vector: np.ndarray,
-    deterministic: bool = False,
-) -> np.ndarray:
-    """Run model inference and return a MultiDiscrete action array."""
-    obs_t = torch.from_numpy(obs_vector).float().unsqueeze(0)
-    logits_flat = model(obs_t)
-
-    actions = []
-    offset = 0
-    for n in ACTION_NVEC:
-        logits = logits_flat[:, offset : offset + n]
-        if deterministic:
-            a = logits.argmax(dim=-1)
-        else:
-            a = torch.distributions.Categorical(logits=logits).sample()
-        actions.append(a.item())
-        offset += n
-
-    return np.array(actions, dtype=np.int64)
-
-
-# ===================================================================
-# 5. EPISODE METRICS
+# EPISODE METRICS
 # ===================================================================
 
 
@@ -483,8 +123,8 @@ def run_episode(
     start_time = time.time()
 
     for frame in range(MAX_EPISODE_FRAMES):
-        # 1. Observation -> vector
-        obs_vec = obs_to_vector(obs)
+        # 1. Observation -> vector (P1 perspective)
+        obs_vec = obs_to_vector(obs, player_idx=0)
 
         # 2. Model inference
         action_indices = get_action(model, obs_vec, deterministic=deterministic)
@@ -524,14 +164,14 @@ def run_episode(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run a trained Puff model against real Melee via OpenEnv.",
+        description="Run jiggly.pt (P1 Jigglypuff) vs mango.pt (P2 Fox) via OpenEnv emulator.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--checkpoint",
         type=str,
         default="../checkpoints/puff_final.pt",
-        help="Path to the .pt model checkpoint",
+        help="Path to P1 Jigglypuff policy (e.g. puff_final.pt)",
     )
     parser.add_argument(
         "--server-url",
