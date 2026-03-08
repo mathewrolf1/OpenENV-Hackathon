@@ -6,7 +6,8 @@ Dolphin/libmelee-backed env would expose, so policies transfer directly.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+import copy
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -122,6 +123,15 @@ class MeleeSimEnv(gym.Env):
         self._prev_percent_opp: float = 0.0
         self._prev_opp_stocks: int = 4
 
+        self._ep_rest_attempts: int = 0
+        self._ep_rest_hits: int = 0
+        self._ep_rest_kills: int = 0
+        self._ep_damage_dealt: float = 0.0
+        self._ep_damage_taken: float = 0.0
+        self._ep_stocks_taken: int = 0
+        self._ep_stocks_lost: int = 0
+        self._prev_self_stocks: int = 4
+
     # ---- Gym API --------------------------------------------------------
 
     def reset(
@@ -135,6 +145,16 @@ class MeleeSimEnv(gym.Env):
         self._prev_percent_self = 0.0
         self._prev_percent_opp = 0.0
         self._prev_opp_stocks = 4
+        self._prev_self_stocks = 4
+
+        self._ep_rest_attempts = 0
+        self._ep_rest_hits = 0
+        self._ep_rest_kills = 0
+        self._ep_damage_dealt = 0.0
+        self._ep_damage_taken = 0.0
+        self._ep_stocks_taken = 0
+        self._ep_stocks_lost = 0
+
         obs = _build_obs(self._state, 0)
         return obs, {}
 
@@ -144,7 +164,36 @@ class MeleeSimEnv(gym.Env):
         agent_action = _decode_action(action)
         opp_action = self.opponent_fn(self._state, 1)
 
+        prev_opp_stocks = self._state.players[1].stock
+        prev_self_stocks = self._state.players[0].stock
+
         self._state = self.sim.step(self._state, [agent_action, opp_action])
+
+        me = self._state.players[0]
+        opp = self._state.players[1]
+
+        if agent_action["special"] and agent_action["stick_y"] < -0.3:
+            self._ep_rest_attempts += 1
+        if (me.action == Action.REST_SLEEP and me.attack_connected
+                and getattr(me, "_current_move_name", "") == "rest"
+                and me.action_frame == 0):
+            self._ep_rest_hits += 1
+
+        stocks_taken = prev_opp_stocks - opp.stock
+        stocks_lost = prev_self_stocks - me.stock
+        if stocks_taken > 0:
+            self._ep_stocks_taken += stocks_taken
+            if getattr(me, "_current_move_name", "") == "rest":
+                self._ep_rest_kills += stocks_taken
+        if stocks_lost > 0:
+            self._ep_stocks_lost += stocks_lost
+
+        dmg_dealt = opp.percent - self._prev_percent_opp
+        dmg_taken = me.percent - self._prev_percent_self
+        if dmg_dealt > 0:
+            self._ep_damage_dealt += dmg_dealt
+        if dmg_taken > 0:
+            self._ep_damage_taken += dmg_taken
 
         obs = _build_obs(self._state, 0)
         reward = self._compute_reward()
@@ -153,17 +202,28 @@ class MeleeSimEnv(gym.Env):
 
         info: Dict[str, Any] = {
             "frame": self._state.frame,
-            "p0_percent": self._state.players[0].percent,
-            "p1_percent": self._state.players[1].percent,
-            "p0_stocks": self._state.players[0].stock,
-            "p1_stocks": self._state.players[1].stock,
+            "p0_percent": me.percent,
+            "p1_percent": opp.percent,
+            "p0_stocks": me.stock,
+            "p1_stocks": opp.stock,
         }
         if terminated:
             info["winner"] = self._state.winner
 
+        if terminated or truncated:
+            info["episode_metrics"] = {
+                "rest_attempts": self._ep_rest_attempts,
+                "rest_hits": self._ep_rest_hits,
+                "rest_kills": self._ep_rest_kills,
+                "damage_dealt": self._ep_damage_dealt,
+                "damage_taken": self._ep_damage_taken,
+                "stocks_taken": self._ep_stocks_taken,
+                "stocks_lost": self._ep_stocks_lost,
+            }
+
         return obs, reward, terminated, truncated, info
 
-    # ---- Reward ----------------------------------------------------------
+    # ---- Reward (base signals only — wrappers add style-specific shaping) --
 
     def _compute_reward(self) -> float:
         me = self._state.players[0]
@@ -183,14 +243,6 @@ class MeleeSimEnv(gym.Env):
 
         if stocks_taken > 0:
             reward += 0.5 * stocks_taken
-            is_rest = getattr(me, "_current_move_name", "") == "rest"
-            if is_rest:
-                reward += 0.5  # extra bonus for a Rest kill
-
-        # Per-frame penalty while stuck in Rest sleep after a miss
-        if (me.action == Action.REST_SLEEP
-                and not me.attack_connected):
-            reward -= 0.002
 
         if self._state.done:
             if self._state.winner == 0:
@@ -206,3 +258,46 @@ class MeleeSimEnv(gym.Env):
     def _dummy_opponent(state: GameState, idx: int) -> Dict:
         """Standing dummy that does nothing."""
         return {"stick_x": 0.0, "stick_y": 0.0, "jump": False, "attack": False, "grab": False, "special": False}
+
+
+# ---------------------------------------------------------------------------
+# Self-play opponent
+# ---------------------------------------------------------------------------
+
+
+class SelfPlayOpponent:
+    """Wraps a frozen PPO policy as an ``opponent_fn`` for MeleeSimEnv.
+
+    Call ``update_from_model(model)`` to copy the current training policy's
+    weights into the opponent.  The opponent then runs inference each frame
+    to choose its actions — same observation/action format as the agent.
+    """
+
+    def __init__(self):
+        self._model = None
+
+    def update_from_model(self, model) -> None:
+        """Snapshot the policy by saving/loading through a temp file."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+            tmppath = f.name
+        try:
+            model.save(tmppath)
+            from stable_baselines3 import PPO
+            self._model = PPO.load(tmppath)
+            self._model.policy.set_training_mode(False)
+        finally:
+            import os
+            os.unlink(tmppath)
+
+    @property
+    def is_ready(self) -> bool:
+        return self._model is not None
+
+    def __call__(self, state: GameState, idx: int) -> Dict:
+        if self._model is None:
+            return MeleeSimEnv._dummy_opponent(state, idx)
+
+        obs = _build_obs(state, idx)
+        action, _ = self._model.predict(obs, deterministic=False)
+        return _decode_action(action)

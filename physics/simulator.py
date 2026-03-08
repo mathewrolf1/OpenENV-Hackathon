@@ -67,9 +67,9 @@ class Simulator:
         return GameState(
             frame=0,
             players=[
-                CharacterState(x=-30.0, y=0.0, facing_right=True,
+                CharacterState(x=-10.0, y=0.0, facing_right=True,
                                on_ground=True, jumps_left=max_j),
-                CharacterState(x=30.0, y=0.0, facing_right=False,
+                CharacterState(x=10.0, y=0.0, facing_right=False,
                                on_ground=True, jumps_left=max_j),
             ],
             stage=Stage(),
@@ -189,6 +189,12 @@ class Simulator:
         attack = act.get("attack", False)
         grab = act.get("grab", False)
         special = act.get("special", False)
+
+        # Only allow Rest when close enough to potentially hit
+        REST_PROXIMITY = 5.0
+        dist = abs(p.x - other.x) + abs(p.y - other.y)
+        if dist > REST_PROXIMITY:
+            special = False
 
         if p.on_ground:
             self._ground_actions(p, sx, sy, jump, attack, grab, special)
