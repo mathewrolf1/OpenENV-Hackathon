@@ -377,8 +377,7 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
                 continue
 
             # ---- P2 ----
-            if self._cpu_level > 0 and not self._first_match_started:
-                # First match only: P2 helper picks Fox + CPU level 9.
+            if not self._first_match_started:
                 self.cpu_menu_helper.menu_helper_simple(
                     gamestate=gamestate,
                     controller=self.cpu_controller,
@@ -392,24 +391,24 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
                     frozen_stadium=False,
                 )
             else:
-                # Subsequent matches (CPU persists) or model-driven: hands off.
+                # Subsequent matches: character persists, hands off.
                 self.cpu_controller.release_all()
 
             # ---- P1 ----
             # On the first match's CSS, hold autostart until P2 finishes
-            # toggling to CPU level 9. Everywhere else, autostart=True so
-            # libmelee instantly selects Puff → FD → go.
+            # selecting. Everywhere else, autostart=True so libmelee
+            # instantly selects character → FD → go.
             p1_autostart = True
             if (
-                self._cpu_level > 0
-                and not self._first_match_started
+                not self._first_match_started
                 and gamestate.menu_state == melee.enums.Menu.CHARACTER_SELECT
             ):
                 p2 = gamestate.players.get(2)
-                if p2 is None or (
+                if p2 is None or not getattr(p2, "coin_down", False):
+                    p1_autostart = False
+                elif self._cpu_level > 0 and (
                     p2.controller_status != melee.enums.ControllerStatus.CONTROLLER_CPU
                     or p2.cpu_level != self._cpu_level
-                    or not p2.coin_down
                 ):
                     p1_autostart = False
 

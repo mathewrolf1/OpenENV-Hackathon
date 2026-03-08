@@ -117,10 +117,11 @@ def _edge_distance(p: Any) -> float:
 @dataclass
 class RewardWeights:
     # Base
-    damage_dealt: float = 0.01
-    damage_taken: float = 0.01
-    stock_taken: float = 0.5
-    win_bonus: float = 1.0
+    damage_dealt: float = 0.05
+    damage_taken: float = 0.000
+    stock_taken: float = 1.0
+    stock_lost: float = 5.0
+    win_bonus: float = 2.0
     loss_penalty: float = 1.0
 
     # Kinetic recovery (off-stage)
@@ -130,14 +131,27 @@ class RewardWeights:
     shield_pressure: float = 0.05
 
     # Hitstun follow-up (combo bonus)
-    combo_bonus: float = 0.02
+    combo_bonus: float = 0.06
 
     # Edge-guarding
-    edgeguard_bonus: float = 0.05
+    edgeguard_bonus: float = 0.08
 
     # Active spacing (velocity while close)
-    velocity_bonus_scale: float = 0.01
-    velocity_proximity: float = 30.0
+    velocity_bonus_scale: float = 0.02
+    velocity_proximity: float = 50.0
+
+    # Approach: reward for closing distance to opponent
+    approach_scale: float = 0.008
+
+    # Proximity: per-frame reward for being near opponent
+    proximity_bonus: float = 0.003
+    proximity_threshold: float = 25.0
+
+    # Anti-SD: survival incentives
+    existence_reward: float = 0.002
+    off_stage_penalty: float = -0.015
+    blastzone_threshold: float = 120.0
+    blastzone_penalty_scale: float = -0.0005
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +167,7 @@ class _FrameState:
     p2_shield: float = 60.0
     p1_edge_dist: float = 0.0
     p1_off_stage: bool = False
+    distance: float = 50.0
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +232,10 @@ class CompetitiveMeleeReward:
         damage_dealt = max(0.0, p2_pct - prev.p2_percent)
         damage_taken = max(0.0, p1_pct - prev.p1_percent)
         stocks_taken = max(0, prev.p2_stocks - p2_stk)
+        stocks_lost = max(0, prev.p1_stocks - p1_stk)
 
         r_damage = damage_dealt * w.damage_dealt - damage_taken * w.damage_taken
-        r_stocks = stocks_taken * w.stock_taken
+        r_stocks = stocks_taken * w.stock_taken - stocks_lost * w.stock_lost
 
         r_terminal = 0.0
         if done:
@@ -264,6 +280,8 @@ class CompetitiveMeleeReward:
 
         # ---- 6. Active spacing (velocity while close) ----
         r_velocity = 0.0
+        r_approach = 0.0
+        r_proximity = 0.0
         if p1 is not None and p2 is not None:
             dx = _pos_x(p1) - _pos_x(p2)
             dy = _pos_y(p1) - _pos_y(p2)
@@ -271,6 +289,31 @@ class CompetitiveMeleeReward:
             if dist <= w.velocity_proximity:
                 speed = abs(_speed_ground_x(p1)) + abs(_speed_air_x(p1))
                 r_velocity = min(speed, 3.0) * w.velocity_bonus_scale
+
+            # ---- 7. Approach: reward for closing distance ----
+            prev_dist = getattr(prev, "distance", dist)
+            dist_delta = prev_dist - dist
+            if dist_delta > 0:
+                r_approach = dist_delta * w.approach_scale
+            prev.distance = dist
+
+            # ---- 8. Proximity: bonus for staying close ----
+            if dist <= w.proximity_threshold:
+                r_proximity = w.proximity_bonus
+
+        # ---- 9. Anti-SD: existence, off-stage, blastzone ----
+        r_existence = 0.0
+        r_off_stage = 0.0
+        r_blastzone = 0.0
+        if p1 is not None:
+            px = _pos_x(p1)
+            if not p1_off:
+                r_existence = w.existence_reward
+            else:
+                r_off_stage = w.off_stage_penalty
+            if abs(px) > w.blastzone_threshold:
+                excess = abs(px) - w.blastzone_threshold
+                r_blastzone = w.blastzone_penalty_scale * (excess * excess)
 
         # ---- Aggregate ----
         reward = (
@@ -282,6 +325,11 @@ class CompetitiveMeleeReward:
             + r_combo
             + r_edgeguard
             + r_velocity
+            + r_approach
+            + r_proximity
+            + r_existence
+            + r_off_stage
+            + r_blastzone
         )
 
         # ---- Update prev state (no ghosting) ----
@@ -307,6 +355,11 @@ class CompetitiveMeleeReward:
             "reward_combo": r_combo,
             "reward_edgeguard": r_edgeguard,
             "reward_velocity": r_velocity,
+            "reward_approach": r_approach,
+            "reward_proximity": r_proximity,
+            "reward_existence": r_existence,
+            "reward_off_stage": r_off_stage,
+            "reward_blastzone": r_blastzone,
             "episode_reward": self._ep_reward,
             "total_damage_dealt": self._ep_damage_dealt,
             "stocks_won": float(self._ep_stocks_won),

@@ -453,7 +453,7 @@ def train(args: argparse.Namespace) -> None:
                     elif next_obs.player_stocks <= 0:
                         winner = 1
                 reward, reward_info = reward_calc.step(
-                    me_proxy, opp_proxy, done=done, winner=winner, action=smash_action,
+                    me_proxy, opp_proxy, done=done, winner=winner,
                 )
 
                 # Store transition
