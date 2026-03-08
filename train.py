@@ -243,6 +243,7 @@ def _train_ppo(args: argparse.Namespace) -> None:
                 max_frames=args.max_frames, opponent_fn=opponent_fn
             )),
             device="cpu",
+            categorical_action_encoding=True,
         )
 
     base_env = ParallelEnv(
@@ -505,6 +506,7 @@ def _run_stability_test() -> None:
     base_env = GymWrapper(
         _ActionConverterWrapper(_create_env(max_frames=3000)),
         device=device,
+        categorical_action_encoding=True,
     )
 
     model = ActorCriticMLP(obs_dim=OBS_DIM, hidden_dim=128, num_layers=2).to(device)
