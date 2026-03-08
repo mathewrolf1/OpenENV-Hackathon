@@ -91,6 +91,21 @@ class SmashObservation(Observation):
         0, description="Remaining stock count for the opponent"
     )
 
+    # --- Physics / state (for reward shaping) ---
+    player_speed_x: float = Field(0.0, description="Player total X velocity")
+    player_speed_y: float = Field(0.0, description="Player total Y velocity")
+    player_on_ground: bool = Field(True, description="Whether the player is grounded")
+    player_facing_right: bool = Field(True, description="Whether the player faces right")
+    player_hitstun_left: int = Field(0, description="Player hitstun frames remaining")
+
+    opponent_speed_x: float = Field(0.0, description="Opponent total X velocity")
+    opponent_speed_y: float = Field(0.0, description="Opponent total Y velocity")
+    opponent_on_ground: bool = Field(True, description="Whether the opponent is grounded")
+    opponent_facing_right: bool = Field(True, description="Whether the opponent faces right")
+    opponent_hitstun_left: int = Field(0, description="Opponent hitstun frames remaining")
+
+    frame: int = Field(0, description="Current game frame number")
+
     # --- General ---
     menu_state: str = Field(
         "unknown",

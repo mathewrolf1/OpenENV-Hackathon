@@ -9,70 +9,62 @@ Usage:
            uv run --project . python test_client.py
 """
 
+import logging
 import sys
+
 from emulator_env import SmashAction, SmashObservation, EmulatorEnv
 
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
-def print_obs(label: str, result):
-    """Pretty-print a StepResult."""
+
+def log_obs(label: str, result) -> None:
+    """Log a single-line summary of a StepResult."""
     obs = result.observation
-    print(f"  [{label}]")
-    print(f"    menu_state           = {obs.menu_state}")
-    print(
-        f"    player  x={obs.player_x:7.2f}  y={obs.player_y:7.2f}  "
-        f"dmg={obs.player_damage:3d}%  stocks={obs.player_stocks}  "
-        f"action={obs.player_action_state}"
+    log.info(
+        "%s | P1(%6.1f,%6.1f) %3d%% stk=%d  P2(%6.1f,%6.1f) %3d%% stk=%d | r=%+.4f done=%s",
+        label,
+        obs.player_x, obs.player_y, obs.player_damage, obs.player_stocks,
+        obs.opponent_x, obs.opponent_y, obs.opponent_damage, obs.opponent_stocks,
+        result.reward or 0.0, result.done,
     )
-    print(
-        f"    opponent x={obs.opponent_x:7.2f}  y={obs.opponent_y:7.2f}  "
-        f"dmg={obs.opponent_damage:3d}%  stocks={obs.opponent_stocks}  "
-        f"action={obs.opponent_action_state}"
-    )
-    print(f"    reward={result.reward}  done={result.done}")
-    print()
 
 
 def main():
     base_url = "http://localhost:8000"
-    print(f"Connecting to {base_url} ...")
 
     try:
         env = EmulatorEnv(base_url=base_url)
         env.connect()
-        print("Connected via WebSocket.\n")
+        log.info("Connected to %s", base_url)
     except ConnectionError as e:
-        print(f"Failed to connect: {e}")
-        print("Is the server running? Start it with: uv run --project . server")
+        log.error("Connection failed: %s — is the server running?", e)
         sys.exit(1)
 
     try:
-        # --- reset (waits for menu navigation to finish) ---
-        print("Calling reset() -- this will navigate menus and start a match ...")
         result = env.reset()
-        print_obs("reset", result)
+        log_obs("reset  ", result)
 
-        # --- a few steps exercising different buttons ---
         actions = [
-            SmashAction(stick_x=0.0, stick_y=0.0),  # neutral
-            SmashAction(stick_x=1.0, stick_y=0.0, button_a=True),  # forward tilt
-            SmashAction(stick_x=-1.0, stick_y=0.5, button_b=True),  # side-B
-            SmashAction(button_y=True),  # jump
-            SmashAction(c_stick_x=1.0),  # c-stick forward smash
-            SmashAction(button_z=True),  # grab
-            SmashAction(button_l=True),  # shield
-            SmashAction(stick_x=0.0, stick_y=-1.0, button_a=True),  # down tilt
+            SmashAction(stick_x=0.0, stick_y=0.0),                           # neutral
+            SmashAction(stick_x=1.0, stick_y=0.0, button_a=True),            # forward tilt
+            SmashAction(stick_x=-1.0, stick_y=0.5, button_b=True),           # side-B
+            SmashAction(button_y=True),                                       # jump
+            SmashAction(c_stick_x=1.0),                                       # c-stick fsmash
+            SmashAction(button_z=True),                                       # grab
+            SmashAction(button_l=True),                                       # shield
+            SmashAction(stick_x=0.0, stick_y=-1.0, button_a=True),           # down tilt
         ]
 
         for i, action in enumerate(actions):
-            print(f"Step {i + 1}: {action.model_dump()}")
             result = env.step(action)
-            print_obs(f"step {i + 1}", result)
+            log_obs(f"step {i+1:2d}", result)
 
-        print("All steps completed successfully.")
+        log.info("All %d steps completed successfully.", len(actions))
 
     finally:
         env.close()
-        print("Client closed.")
+        log.info("Client closed.")
 
 
 if __name__ == "__main__":

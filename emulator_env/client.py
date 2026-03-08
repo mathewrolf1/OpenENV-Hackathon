@@ -84,13 +84,26 @@ class EmulatorEnv(EnvClient[SmashAction, SmashObservation, State]):
             player_damage=obs_data.get("player_damage", 0),
             player_action_state=obs_data.get("player_action_state", "unknown"),
             player_stocks=obs_data.get("player_stocks", 0),
+            # Player 1 physics
+            player_speed_x=obs_data.get("player_speed_x", 0.0),
+            player_speed_y=obs_data.get("player_speed_y", 0.0),
+            player_on_ground=obs_data.get("player_on_ground", True),
+            player_facing_right=obs_data.get("player_facing_right", True),
+            player_hitstun_left=obs_data.get("player_hitstun_left", 0),
             # Player 2 (opponent)
             opponent_x=obs_data.get("opponent_x", 0.0),
             opponent_y=obs_data.get("opponent_y", 0.0),
             opponent_damage=obs_data.get("opponent_damage", 0),
             opponent_action_state=obs_data.get("opponent_action_state", "unknown"),
             opponent_stocks=obs_data.get("opponent_stocks", 0),
+            # Player 2 physics
+            opponent_speed_x=obs_data.get("opponent_speed_x", 0.0),
+            opponent_speed_y=obs_data.get("opponent_speed_y", 0.0),
+            opponent_on_ground=obs_data.get("opponent_on_ground", True),
+            opponent_facing_right=obs_data.get("opponent_facing_right", True),
+            opponent_hitstun_left=obs_data.get("opponent_hitstun_left", 0),
             # General
+            frame=obs_data.get("frame", 0),
             menu_state=obs_data.get("menu_state", "unknown"),
         )
 

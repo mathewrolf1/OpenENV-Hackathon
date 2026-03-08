@@ -67,6 +67,11 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._connected = False
 
+        # Delta-tracking for reward computation (mirrors MeleeSimEnv)
+        self._prev_player_damage: float = 0.0
+        self._prev_opponent_damage: float = 0.0
+        self._prev_opponent_stocks: int = 4
+
         try:
             self._init_emulator()
         except Exception:
@@ -184,6 +189,11 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
             step_count=0,
         )
 
+        # Reset delta-tracking for the new episode.
+        self._prev_player_damage = 0.0
+        self._prev_opponent_damage = 0.0
+        self._prev_opponent_stocks = 4
+
         # Re-create menu helpers so internal state is clean for a new episode.
         self.menu_helper = melee.MenuHelper()
         self.cpu_menu_helper = melee.MenuHelper()
@@ -280,9 +290,27 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
 
         obs = self._make_observation(gamestate, done=done)
 
-        # Simple reward: survive +1, penalise damage taken, bonus for
-        # damage dealt to the opponent.
-        reward = 1.0 - (obs.player_damage / 100.0) + (obs.opponent_damage / 200.0)
+        # Delta-based reward (ported from MeleeSimEnv._compute_reward)
+        damage_dealt = max(0.0, obs.opponent_damage - self._prev_opponent_damage)
+        damage_taken = max(0.0, obs.player_damage - self._prev_player_damage)
+        stocks_taken = max(0, self._prev_opponent_stocks - obs.opponent_stocks)
+
+        reward = 0.0
+        reward += damage_dealt * 0.01   # +0.01 per % dealt
+        reward -= damage_taken * 0.01   # -0.01 per % taken
+        reward += stocks_taken * 0.5    # +0.5 per stock taken
+
+        if done:
+            if obs.opponent_stocks <= 0:
+                reward += 1.0           # win bonus
+            elif obs.player_stocks <= 0:
+                reward -= 1.0           # loss penalty
+
+        # Update trackers for next frame
+        self._prev_player_damage = obs.player_damage
+        self._prev_opponent_damage = obs.opponent_damage
+        self._prev_opponent_stocks = obs.opponent_stocks
+
         obs.reward = reward
         return obs
 
@@ -338,13 +366,26 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
             player_damage=int(p1.percent) if p1 else 0,
             player_action_state=p1.action.name if p1 else "unknown",
             player_stocks=int(p1.stock) if p1 else 0,
+            # Player 1 physics
+            player_speed_x=float(getattr(p1, 'speed_x_attack', 0) + getattr(p1, 'speed_ground_x_self', 0)) if p1 else 0.0,
+            player_speed_y=float(getattr(p1, 'speed_y_attack', 0) + getattr(p1, 'speed_y_self', 0)) if p1 else 0.0,
+            player_on_ground=bool(p1.on_ground) if p1 else True,
+            player_facing_right=bool(p1.facing) if p1 else True,
+            player_hitstun_left=int(p1.hitstun_frames_left) if p1 else 0,
             # Player 2
             opponent_x=float(p2.position.x) if p2 else 0.0,
             opponent_y=float(p2.position.y) if p2 else 0.0,
             opponent_damage=int(p2.percent) if p2 else 0,
             opponent_action_state=p2.action.name if p2 else "unknown",
             opponent_stocks=int(p2.stock) if p2 else 0,
+            # Player 2 physics
+            opponent_speed_x=float(getattr(p2, 'speed_x_attack', 0) + getattr(p2, 'speed_ground_x_self', 0)) if p2 else 0.0,
+            opponent_speed_y=float(getattr(p2, 'speed_y_attack', 0) + getattr(p2, 'speed_y_self', 0)) if p2 else 0.0,
+            opponent_on_ground=bool(p2.on_ground) if p2 else True,
+            opponent_facing_right=bool(p2.facing) if p2 else True,
+            opponent_hitstun_left=int(p2.hitstun_frames_left) if p2 else 0,
             # General
+            frame=int(gamestate.frame) if hasattr(gamestate, 'frame') else 0,
             menu_state=menu_state_str,
             reward=reward,
             done=done,
