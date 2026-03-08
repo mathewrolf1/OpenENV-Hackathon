@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import configparser
 import logging
-import math
 import os
 from collections import deque
 from typing import Any, Optional
@@ -17,6 +16,8 @@ import torch
 from tensordict import TensorDict
 from torchrl.data import Bounded, Composite, MultiCategorical, Unbounded
 from torchrl.envs import EnvBase
+
+from rewards.competitive import CompetitiveMeleeReward
 
 log = logging.getLogger(__name__)
 
@@ -64,13 +65,6 @@ SHIELD_SCALE = 60.0
 TIMER_SCALE = 60.0
 ECB_SCALE = 50.0
 
-# Mango reward shaping
-PROXIMITY_DISTANCE = 30.0
-PROXIMITY_BONUS = 0.05
-SHIELD_PRESSURE_BONUS = 2.0
-RECOVERY_BONUS = 1.0
-DISADVANTAGE_Y_THRESHOLD = 5.0
-DISADVANTAGE_X_THRESHOLD = 55.0
 STAGE_RIGHT_EDGE = 68.4
 
 
@@ -144,20 +138,8 @@ class MeleeTorchEnv(EnvBase):
         # 2-frame input latency buffer: agent action queued, action from 2 frames ago sent
         self._action_buffer: deque = deque(maxlen=2)
 
-        # Delta tracking for reward
-        self._prev_p1_percent: float = 0.0
-        self._prev_p2_percent: float = 0.0
-        self._prev_p2_stocks: int = 4
-        self._prev_p1_stocks: int = 4
-        self._prev_p2_shield: float = 60.0
-
-        # Mango shaping
-        self._was_in_disadvantage: bool = False
-
-        # Episode diagnostics
-        self._ep_reward: float = 0.0
-        self._ep_damage_dealt: float = 0.0
-        self._ep_stocks_won: int = 0
+        # Unified reward calculator
+        self._reward_calc = CompetitiveMeleeReward()
 
         if not skip_emulator_init:
             _ensure_melee()
@@ -410,15 +392,7 @@ class MeleeTorchEnv(EnvBase):
         if self._skip_emulator_init or self._console is None:
             raise RuntimeError("MeleeTorchEnv: cannot reset without emulator. Construct with skip_emulator_init=False and valid DOLPHIN_PATH.")
         self._action_buffer.clear()
-        self._prev_p1_percent = 0.0
-        self._prev_p2_percent = 0.0
-        self._prev_p2_stocks = 4
-        self._prev_p1_stocks = 4
-        self._prev_p2_shield = 60.0
-        self._was_in_disadvantage = False
-        self._ep_reward = 0.0
-        self._ep_damage_dealt = 0.0
-        self._ep_stocks_won = 0
+        self._reward_calc.reset()
 
         self._menu_helper = MenuHelper()
         self._cpu_menu_helper = MenuHelper()
@@ -428,16 +402,6 @@ class MeleeTorchEnv(EnvBase):
             if gamestate is None:
                 continue
             if gamestate.menu_state in (melee.Menu.IN_GAME, melee.Menu.SUDDEN_DEATH):
-                p1 = gamestate.players.get(1)
-                p2 = gamestate.players.get(2)
-                if p1:
-                    self._prev_p1_percent = float(p1.percent)
-                    self._prev_p1_stocks = int(p1.stock)
-                if p2:
-                    self._prev_p2_percent = float(p2.percent)
-                    self._prev_p2_stocks = int(p2.stock)
-                    self._prev_p2_shield = float(getattr(p2, "shield_strength", 60.0))
-
                 obs_td = self._gamestate_to_obs_tensordict(gamestate)
                 done_t = torch.zeros(*self.batch_size, 1, dtype=torch.bool, device=self.device)
                 obs_td["done"] = done_t
@@ -502,56 +466,14 @@ class MeleeTorchEnv(EnvBase):
         p1 = gamestate.players.get(1) if gamestate else None
         p2 = gamestate.players.get(2) if gamestate else None
 
-        # Base reward (deltas)
-        damage_dealt = max(0.0, (float(p2.percent) if p2 else 0) - self._prev_p2_percent)
-        damage_taken = max(0.0, (float(p1.percent) if p1 else 0) - self._prev_p1_percent)
-        stocks_taken = max(0, self._prev_p2_stocks - (int(p2.stock) if p2 else 0))
+        # Determine winner index (0-based for CompetitiveMeleeReward)
+        winner = None
+        if done and gamestate:
+            w = getattr(gamestate, "winner", None)
+            if w is not None:
+                winner = 0 if w == 1 else 1  # port 1 -> idx 0, port 2 -> idx 1
 
-        reward = 0.0
-        reward += damage_dealt * 0.01
-        reward -= damage_taken * 0.01
-        reward += stocks_taken * 0.5
-
-        # Mango shaping
-        if p1 and p2:
-            dx = float(p1.position.x) - float(p2.position.x)
-            dy = float(p1.position.y) - float(p2.position.y)
-            dist = math.sqrt(dx * dx + dy * dy)
-            if dist <= PROXIMITY_DISTANCE:
-                reward += PROXIMITY_BONUS
-
-            if damage_dealt > 0:
-                reward += SHIELD_PRESSURE_BONUS
-
-            low_or_far = (
-                (not p1.on_ground and float(p1.position.y) < DISADVANTAGE_Y_THRESHOLD)
-                or abs(float(p1.position.x)) > DISADVANTAGE_X_THRESHOLD
-            )
-            in_hitstun = getattr(p1, "hitstun_frames_left", 0) > 0
-            in_disadvantage = low_or_far or in_hitstun
-
-            on_stage = p1.on_ground and float(p1.position.y) >= 0 and abs(float(p1.position.x)) <= STAGE_RIGHT_EDGE
-            if self._was_in_disadvantage and on_stage and not in_hitstun:
-                reward += RECOVERY_BONUS
-
-            self._was_in_disadvantage = in_disadvantage
-
-        if done and gamestate and hasattr(gamestate, "winner") and gamestate.winner is not None:
-            if gamestate.winner == 1:
-                reward += 1.0
-            elif gamestate.winner == 2:
-                reward -= 1.0
-
-        self._prev_p1_percent = float(p1.percent) if p1 else 0.0
-        self._prev_p2_percent = float(p2.percent) if p2 else 0.0
-        self._prev_p2_stocks = int(p2.stock) if p2 else 4
-        self._prev_p1_stocks = int(p1.stock) if p1 else 4
-        if p2:
-            self._prev_p2_shield = float(getattr(p2, "shield_strength", 60.0))
-
-        self._ep_reward += reward
-        self._ep_damage_dealt += damage_dealt
-        self._ep_stocks_won += stocks_taken
+        reward, reward_info = self._reward_calc.step(p1, p2, done=done, winner=winner)
 
         obs_td = self._gamestate_to_obs_tensordict(gamestate) if gamestate else self.observation_spec.zero()
         reward_t = torch.tensor(reward, dtype=torch.float32, device=self.device)
@@ -574,9 +496,8 @@ class MeleeTorchEnv(EnvBase):
             device=self.device,
         )
 
-        out["episode_reward"] = torch.tensor(self._ep_reward, device=self.device)
-        out["total_damage_dealt"] = torch.tensor(self._ep_damage_dealt, device=self.device)
-        out["stocks_won"] = torch.tensor(self._ep_stocks_won, dtype=torch.int64, device=self.device)
+        for k, v in reward_info.items():
+            out[k] = torch.tensor(v, device=self.device)
 
         return out
 

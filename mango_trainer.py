@@ -20,7 +20,6 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="torchrl.envs.libs.gym")
 
 import argparse
-import math
 import signal
 import sys
 from pathlib import Path
@@ -35,31 +34,23 @@ from envs.melee_sim_env import MeleeSimEnv, OBS_DIM
 from opponents import load_opponent
 from physics.constants import Action, STAGE
 from physics.state import CharacterState, GameState, Stage
-
-
-# ---------------------------------------------------------------------------
-# MangoRewardWrapper
-# ---------------------------------------------------------------------------
-
-PROXIMITY_DISTANCE = 30.0
-PROXIMITY_BONUS = 0.05
-SHIELD_PRESSURE_BONUS = 2.0
-MOVEMENT_BONUS = 0.02
-RECOVERY_BONUS = 1.0
-DISADVANTAGE_Y_THRESHOLD = 5.0
-DISADVANTAGE_X_THRESHOLD = 55.0
+from rewards.competitive import CompetitiveMeleeReward
 
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_INTERVAL_FRAMES = 1_000_000
 
 
 class MangoRewardWrapper(gym.Wrapper):
-    """Wraps MeleeSimEnv with Mang0-style heuristic reward shaping."""
+    """Wraps MeleeSimEnv with CompetitiveMeleeReward.
+
+    Replaces the old flat-bonus Mango shaping with deep-variable reward
+    logic (kinetic recovery, shield pressure 2.0, combo bonus, edge-guarding,
+    active spacing).  The base env's own reward is disabled (overridden).
+    """
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
-        self._prev_p1_percent: float = 0.0
-        self._was_in_disadvantage: bool = False
+        self._reward_calc = CompetitiveMeleeReward()
 
     def reset(
         self,
@@ -68,67 +59,27 @@ class MangoRewardWrapper(gym.Wrapper):
         options: Optional[Dict] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         obs, info = self.env.reset(seed=seed, options=options)
-        self._prev_p1_percent = 0.0
-        self._was_in_disadvantage = False
+        self._reward_calc.reset()
         return obs, info
 
     def step(
         self, action: np.ndarray
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        bonus = self._compute_mango_bonus(terminated, truncated)
-        return obs, reward + bonus, terminated, truncated, info
+        obs, base_reward, terminated, truncated, info = self.env.step(action)
 
-    def _is_disadvantage(self, gs: GameState) -> bool:
-        """Agent in disadvantage: low/far off-stage or in hitstun."""
-        me = gs.players[0]
-        if me.action == Action.DEAD or me.action == Action.RESPAWN_INVULN:
-            return False
-        low_or_far = (
-            (not me.on_ground and me.y < DISADVANTAGE_Y_THRESHOLD)
-            or abs(me.x) > DISADVANTAGE_X_THRESHOLD
-        )
-        in_hitstun = me.hitstun_frames_left > 0
-        return low_or_far or in_hitstun
-
-    def _returned_to_stage(self, gs: GameState) -> bool:
-        """Agent just returned to stage from disadvantage."""
-        me = gs.players[0]
-        on_stage = me.on_ground and me.y >= 0 and abs(me.x) <= STAGE["right_edge"]
-        return self._was_in_disadvantage and on_stage and me.hitstun_frames_left <= 0
-
-    def _compute_mango_bonus(self, terminated: bool, truncated: bool) -> float:
-        bonus = 0.0
         state = getattr(self.env, "_state", None)
         if state is None:
-            return bonus
+            return obs, base_reward, terminated, truncated, info
 
         me = state.players[0]
         opp = state.players[1]
+        winner = state.winner if state.done else None
 
-        # Proximity: +0.05 per frame when close to opponent
-        dx = me.x - opp.x
-        dy = me.y - opp.y
-        dist = math.sqrt(dx * dx + dy * dy)
-        if dist <= PROXIMITY_DISTANCE:
-            bonus += PROXIMITY_BONUS
-
-        # Shield pressure: +2.0 when dealing damage (sim has no shields; proxy)
-        damage_dealt = opp.percent - self._prev_p1_percent
-        if damage_dealt > 0:
-            bonus += SHIELD_PRESSURE_BONUS
-        self._prev_p1_percent = opp.percent
-
-        # Movement incentive: small reward for RUN or AIRBORNE (anti-camping)
-        if me.action == Action.RUN or me.action == Action.AIRBORNE:
-            bonus += MOVEMENT_BONUS
-
-        # High-risk recovery: bonus for returning to stage from disadvantage
-        if self._returned_to_stage(state):
-            bonus += RECOVERY_BONUS
-
-        self._was_in_disadvantage = self._is_disadvantage(state)
-        return bonus
+        reward, reward_info = self._reward_calc.step(
+            me, opp, done=state.done, winner=winner,
+        )
+        info.update(reward_info)
+        return obs, reward, terminated, truncated, info
 
 
 # ---------------------------------------------------------------------------
@@ -806,8 +757,7 @@ def test_reward_logic() -> None:
             return game_state.copy()
 
         inner.sim.step = mock_step
-        env._prev_p1_percent = game_state.players[1].percent
-        env._was_in_disadvantage = False
+        env._reward_calc.reset()
         inner._prev_percent_self = game_state.players[0].percent
         inner._prev_percent_opp = game_state.players[1].percent
         inner._prev_opp_stocks = game_state.players[1].stock
@@ -827,7 +777,7 @@ def test_reward_logic() -> None:
         winner=None,
     )
     near_reward = run_scenario("Near Opponent", near_state)
-    print(f"Near Opponent (dist=15): reward={near_reward:.4f} (expect +{PROXIMITY_BONUS} proximity)")
+    print(f"Near Opponent (dist=15): reward={near_reward:.4f} (expect velocity bonus when close)")
 
     # 2. Far From Opponent: players far apart -> no proximity bonus
     far_state = GameState(
@@ -841,7 +791,7 @@ def test_reward_logic() -> None:
         winner=None,
     )
     far_reward = run_scenario("Far From Opponent", far_state)
-    print(f"Far From Opponent (dist=100): reward={far_reward:.4f} (expect no proximity)")
+    print(f"Far From Opponent (dist=100): reward={far_reward:.4f} (expect no velocity bonus)")
 
     # 3. Self-Destruct: agent dead (lost) -> negative base reward
     self_destruct_state = GameState(
@@ -858,7 +808,9 @@ def test_reward_logic() -> None:
     print(f"Self-Destruct (agent dead, winner=opp): reward={self_destruct_reward:.4f} (expect -1.0 loss)")
 
     print()
-    print("Multipliers: PROXIMITY=+0.05, SHIELD_PRESSURE=+2.0, MOVEMENT=+0.02, RECOVERY=+1.0")
+    print("CompetitiveMeleeReward: damage ±0.01, stock +0.5, win/loss ±1.0, "
+          "recovery=0.03*dist*jumps, pressure=0.05*shield_delta, combo=+0.02, "
+          "edgeguard=+0.05, velocity=speed*0.01")
 
 
 # ---------------------------------------------------------------------------
