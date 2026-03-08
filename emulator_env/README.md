@@ -38,6 +38,8 @@ Then edit `.env` — uncomment and set the three variables for your platform (se
 | `DOLPHIN_PATH` | Yes | Directory containing the Slippi Dolphin executable |
 | `ISO_PATH` | Yes | Full path to the Melee v1.02 ISO file |
 | `DOLPHIN_HOME` | No | Dolphin user config directory. If set, uses your existing controller/graphics config instead of a temp directory |
+| `PUFF_CHECKPOINT_PATH` | No | Path to P2 Jigglypuff policy (default: `checkpoints/puff_final.pt`) |
+| `TRAINING_MODE` | No | `NORMAL` (default) or `RECOVERY`. If `RECOVERY`, each reset runs a scripted phase to spawn P1 off-stage for recovery training. |
 
 The server loads `.env` automatically at startup via `python-dotenv`. You can also export the variables manually if you prefer.
 
@@ -109,7 +111,7 @@ from emulator_env import EmulatorEnv, SmashAction
 env = EmulatorEnv(base_url="http://localhost:8000")
 env.connect()
 
-# reset() navigates menus and starts a match (Fox vs CPU Falco on Final Destination)
+# reset() navigates menus and starts a match (Fox vs Puff on Final Destination)
 obs = env.reset()
 print(f"Match started! Player at ({obs.player_x}, {obs.player_y})")
 
@@ -195,23 +197,32 @@ env.close()
 
 ## Match Configuration
 
-By default the environment runs:
-- **Player 1 (agent):** Fox
-- **Player 2 (CPU):** Falco, Level 3
+By default the environment runs (set up for Dolphin training):
+- **Player 1 (agent):** Fox — controlled by the client (e.g. MeleeTorchEnv or train_emulator).
+- **Player 2 (opponent):** Jigglypuff — controlled by `puff_final.pt` on the server (no CPU).
 - **Stage:** Final Destination
 
-These are set in `server/emulator_env_environment.py`. To change them, edit:
+These are set in `server/emulator_env_environment.py`. To change characters or the P2 checkpoint:
 
 ```python
-self._character = melee.Character.FOX          # your character
-self._cpu_character = melee.Character.FALCO    # CPU character
-self._stage = melee.Stage.FINAL_DESTINATION    # stage
-self._cpu_level = 3                            # CPU difficulty (1-9)
+self._character = melee.Character.FOX          # P1 (agent)
+self._cpu_character = melee.Character.JIGGLYPUFF   # P2 (puff policy)
+self._stage = melee.Stage.FINAL_DESTINATION
+# P2 policy path: set PUFF_CHECKPOINT_PATH or use checkpoints/puff_final.pt
 ```
 
 **Characters:** `FOX`, `FALCO`, `MARTH`, `SHEIK`, `CPTFALCON`, `PEACH`, `JIGGLYPUFF`, `SAMUS`, `DK`, `LINK`, `YLINK`, `PIKACHU`, `MARIO`, `LUIGI`, `DOC`, `GANONDORF`, `ROY`, `MEWTWO`, `NESS`, `YOSHI`, `KIRBY`, `BOWSER`, `PICHU`, `GAMEANDWATCH`, `ZELDA`, `POPO`
 
 **Stages:** `FINAL_DESTINATION`, `BATTLEFIELD`, `DREAMLAND`, `YOSHIS_STORY`, `FOUNTAIN_OF_DREAMS`, `POKEMON_STADIUM`
+
+### Pro-Play training (Dolphin fine-tuning)
+
+The server and `dolphin_train.py` support reward shaping and curriculum learning for more purposeful behavior:
+
+- **Reward shaping:** Distance reward (-0.001× to opponent), center-stage bias (+0.005 when |x| &lt; 25), and action clipping (penalty for noisy inputs during hitlag/jumpsquat). See `emulator_env/melee_constants.py` and `rewards/competitive.py`.
+- **Observation normalization:** Positions are scaled by Final Destination blastzones (~[-1, 1]); all 5 speeds are normalized by character `terminal_velocity` and `max_jump_velocity` (Fox/Puff constants in `melee_constants.py`).
+- **Exploration decay:** Use `--entropy-coef`, `--entropy-coef-min`, and `--entropy-decay-frames` (default 500k) so entropy coefficient decays linearly and the policy settles into purposeful movement.
+- **Curriculum RECOVERY:** Set `TRAINING_MODE=RECOVERY` (or run `dolphin_train.py --training-mode RECOVERY`). Each reset spawns P1 off-stage and P2 center; when recovery success rate over recent episodes exceeds 80%, training switches to `NORMAL` automatically.
 
 ## Project Structure
 

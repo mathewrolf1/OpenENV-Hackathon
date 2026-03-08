@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run jiggly.pt (P1 Jigglypuff) against mango.pt (P2 Fox) via the OpenEnv emulator.
+"""Run Fox policy (P1) vs Puff (P2) via the OpenEnv emulator — for Dolphin training.
 
-Port 1: Jigglypuff, controlled by this client using jiggly.pt.
-Port 2: Fox (Mango), controlled by mango.pt on the server.
+Port 1: Fox, controlled by this client (e.g. mango_final.pt or your Fox checkpoint).
+Port 2: Jigglypuff, controlled by puff_final.pt on the server.
 
 Prerequisites:
     1. Install dependencies (once):
@@ -16,7 +16,7 @@ Prerequisites:
     3. Run this script:
            cd emulator_env
            uv run python train_emulator.py
-           uv run python train_emulator.py --checkpoint ../checkpoints/jiggly.pt
+           uv run python train_emulator.py --checkpoint ../checkpoints/mango_final.pt
            uv run python train_emulator.py --deterministic --num-episodes 5
 """
 
@@ -170,8 +170,8 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="../checkpoints/puff_final.pt",
-        help="Path to P1 Jigglypuff policy (e.g. puff_final.pt)",
+        default="../checkpoints/mango_final.pt",
+        help="Path to P1 Fox policy (e.g. mango_final.pt) for Dolphin training",
     )
     parser.add_argument(
         "--server-url",

@@ -7,16 +7,19 @@ It inherits from `openenv.core.env_server.interfaces.Environment` and defines:
 * `state` property – returns the current session state.
 * `close()` – shuts down the Dolphin process.
 
-Port 1: Jigglypuff, controlled by client (jiggly.pt via train_emulator.py).
-Port 2: Fox (Mango), controlled by mango.pt policy on the server.
+Port 1: Fox (agent), controlled by client — for Dolphin training (e.g. MeleeTorchEnv).
+Port 2: Jigglypuff (opponent), controlled by puff_final.pt on the server.
 
 Environment variables:
     DOLPHIN_PATH         – (required) directory containing the Slippi Dolphin executable.
     ISO_PATH             – (optional) path to the Melee ISO file.
     DOLPHIN_HOME         – (optional) path to the Dolphin user/home directory.
-    MANGO_CHECKPOINT_PATH – (optional) path to mango.pt for P2. Default: checkpoints/mango.pt
+    PUFF_CHECKPOINT_PATH – (optional) path to puff policy for P2. Default: checkpoints/puff_final.pt
+    TRAINING_MODE        – "NORMAL" (default) or "RECOVERY". If RECOVERY, each reset runs a short
+                           scripted phase to spawn agent off-stage and opponent center for recovery training.
 """
 
+import math
 import os
 import logging
 import configparser
@@ -46,6 +49,24 @@ configparser.ConfigParser = _LenientConfigParser  # type: ignore[misc]
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
 
+from ..melee_constants import (
+    CENTER_STAGE_REWARD,
+    CENTER_STAGE_X_THRESHOLD,
+    DISTANCE_REWARD_SCALE,
+    FD_HALF_HEIGHT_Y,
+    FD_HALF_WIDTH_X,
+    FD_MID_X,
+    FD_MID_Y,
+    FOX_MAX_HORIZONTAL_SPEED,
+    FOX_MAX_JUMP_VELOCITY,
+    FOX_TERMINAL_VELOCITY,
+    NOISE_PENALTY_HITLAG_JUMPSQUAT,
+    PUFF_MAX_HORIZONTAL_SPEED,
+    PUFF_MAX_JUMP_VELOCITY,
+    PUFF_TERMINAL_VELOCITY,
+    STAGE_LEFT_EDGE,
+    STAGE_RIGHT_EDGE,
+)
 from ..models import SmashAction, SmashObservation
 from ..policy_runner import (
     action_to_smash,
@@ -61,6 +82,9 @@ log = logging.getLogger(__name__)
 
 # Maximum number of frames to spend in menu navigation before giving up.
 _MAX_MENU_FRAMES = 3600  # ~60 seconds at 60 fps
+
+# RECOVERY mode: frames to run scripted "agent off-stage, opponent center" before returning control.
+_RECOVERY_SETUP_FRAMES = 120  # ~2 seconds
 
 
 class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
@@ -81,9 +105,10 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         self._prev_opponent_damage: float = 0.0
         self._prev_opponent_stocks: int = 4
 
-        # P2 mango.pt policy (port 2 = Fox)
-        self._mango_model = None
+        # P2 puff policy (port 2 = Jigglypuff)
+        self._p2_model = None
         self._last_gamestate = None
+        self._training_mode = (os.environ.get("TRAINING_MODE", "NORMAL") or "NORMAL").strip().upper()
 
         try:
             self._init_emulator()
@@ -149,28 +174,27 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         self.menu_helper = melee.MenuHelper()
         self.cpu_menu_helper = melee.MenuHelper()
 
-        # Configurable match parameters (can be exposed later).
-        # Port 1: Jigglypuff (client sends actions from puff_final.pt)
-        # Port 2: Fox (Mango) – controlled by mango model, never CPU
-        self._character = melee.Character.JIGGLYPUFF
-        self._cpu_character = melee.Character.FOX
+        # Configurable match parameters (Dolphin training: P1 Fox, P2 Puff).
+        # Port 1: Fox (agent) – client sends actions (e.g. MeleeTorchEnv / train_emulator).
+        # Port 2: Jigglypuff (opponent) – controlled by puff policy on server.
+        self._character = melee.Character.FOX
+        self._cpu_character = melee.Character.JIGGLYPUFF
         self._stage = melee.Stage.FINAL_DESTINATION
-        # P2 is always human-controlled (cpu_level=0) so we drive it with mango model
-        self._cpu_level = 0
+        self._cpu_level = 0  # P2 driven by puff policy, not CPU
 
-        # Load mango model for P2 (required – no CPU fallback)
-        mango_path = os.environ.get(
-            "MANGO_CHECKPOINT_PATH",
-            os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints", "mango_final.pt"),
+        # Load puff policy for P2 (Jigglypuff)
+        puff_path = os.environ.get(
+            "PUFF_CHECKPOINT_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints", "puff_final.pt"),
         )
-        if os.path.isfile(mango_path):
-            self._mango_model = load_model(mango_path, device="cpu")
-            log.info("P2 (Fox) controlled by mango model from %s", mango_path)
+        if os.path.isfile(puff_path):
+            self._p2_model = load_model(puff_path, device="cpu")
+            log.info("P2 (Jigglypuff) controlled by puff model from %s", puff_path)
         else:
             log.warning(
-                "Mango model not found at %s – P2 will hold neutral. "
-                "Set MANGO_CHECKPOINT_PATH or place mango_final.pt in checkpoints/.",
-                mango_path,
+                "Puff model not found at %s – P2 will hold neutral. "
+                "Set PUFF_CHECKPOINT_PATH or place puff_final.pt in checkpoints/.",
+                puff_path,
             )
 
         # Launch the emulator process.
@@ -214,7 +238,15 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         select) using `melee.MenuHelper`, then returns the first in-game
         observation.  If we're already in a match (e.g. previous episode
         ended), the postgame screen is skipped first.
+
+        kwargs:
+            training_mode: Override for this reset only ("NORMAL" | "RECOVERY").
+                           Use when implementing curriculum (e.g. switch to NORMAL when recovery success rate > 80%).
         """
+        training_override = (kwargs.get("training_mode") or "").strip().upper()
+        use_recovery = (training_override == "RECOVERY") or (
+            training_override != "NORMAL" and self._training_mode == "RECOVERY"
+        )
         self._state = State(
             episode_id=episode_id or str(uuid4()),
             step_count=0,
@@ -242,6 +274,10 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
             ):
                 log.info("reset(): match started after %d menu frames.", frame_idx)
                 self._last_gamestate = gamestate
+                # Curriculum: RECOVERY mode — scripted phase to put P1 off-stage, P2 center
+                if use_recovery:
+                    gamestate = self._run_recovery_setup(gamestate, frame_idx)
+                    self._last_gamestate = gamestate
                 return self._make_observation(gamestate, reward=0.0, done=False)
 
             # Let MenuHelper drive inputs for both controllers.
@@ -273,6 +309,42 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         gamestate = self.console.step()
         self._last_gamestate = gamestate
         return self._make_observation(gamestate, reward=0.0, done=False)
+
+    def _run_recovery_setup(self, gamestate, menu_frame_start: int):
+        """Run scripted phase: P1 moves off-stage, P2 holds center. Returns gamestate after setup."""
+        log.info("RECOVERY mode: running %d setup frames (P1 off-stage, P2 center).", _RECOVERY_SETUP_FRAMES)
+        for i in range(_RECOVERY_SETUP_FRAMES):
+            p1 = gamestate.players.get(1) if gamestate else None
+            p2 = gamestate.players.get(2) if gamestate else None
+            # P1: walk toward nearest ledge and jump off
+            if p1 and hasattr(p1.position, "x"):
+                px = float(p1.position.x)
+                # Move toward left edge if we're right of center, else toward right edge
+                if px > 10:
+                    self.controller.tilt_analog_unit(Button.BUTTON_MAIN, 1.0, 0.0)  # right toward edge
+                elif px < -10:
+                    self.controller.tilt_analog_unit(Button.BUTTON_MAIN, -1.0, 0.0)  # left toward edge
+                else:
+                    self.controller.tilt_analog_unit(Button.BUTTON_MAIN, -1.0, 0.0)  # default left
+                # Jump after a short run so we go off-stage (e.g. frame 20–40 and 60–80)
+                if 25 <= i <= 28 or 55 <= i <= 58:
+                    self.controller.press_button(Button.BUTTON_X)
+                else:
+                    self.controller.release_button(Button.BUTTON_X)
+                self.controller.tilt_analog_unit(Button.BUTTON_C, 0.0, 0.0)
+                for btn in (Button.BUTTON_A, Button.BUTTON_B, Button.BUTTON_Y, Button.BUTTON_Z, Button.BUTTON_L, Button.BUTTON_R):
+                    self.controller.release_button(btn)
+            # P2: neutral
+            self.cpu_controller.tilt_analog_unit(Button.BUTTON_MAIN, 0.0, 0.0)
+            self.cpu_controller.tilt_analog_unit(Button.BUTTON_C, 0.0, 0.0)
+            for btn in (Button.BUTTON_A, Button.BUTTON_B, Button.BUTTON_X, Button.BUTTON_Y, Button.BUTTON_Z, Button.BUTTON_L, Button.BUTTON_R):
+                self.cpu_controller.release_button(btn)
+            gamestate = self.console.step()
+            self._last_gamestate = gamestate
+            if gamestate is not None and gamestate.menu_state == melee.Menu.POSTGAME_SCORES:
+                break
+        log.info("RECOVERY setup complete.")
+        return gamestate
 
     # ------------------------------------------------------------------
     def step(
@@ -313,12 +385,12 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
             else:
                 self.controller.release_button(button)
 
-        # P2 (Fox): apply mango model action before stepping (never use CPU AI)
+        # P2 (Puff): apply puff policy action before stepping (never use CPU AI)
         if self._last_gamestate is not None:
-            if self._mango_model is not None:
+            if self._p2_model is not None:
                 obs_p2 = self._make_observation(self._last_gamestate, done=False)
                 obs_vec = obs_to_vector(obs_p2, player_idx=1)  # P2 perspective
-                action_indices = get_action(self._mango_model, obs_vec, deterministic=True)
+                action_indices = get_action(self._p2_model, obs_vec, deterministic=True)
                 smash_p2 = action_to_smash(action_indices)
             else:
                 smash_p2 = SmashAction()  # neutral when model not loaded
@@ -339,6 +411,7 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
                     self.cpu_controller.release_button(button)
 
         # Advance the emulator one frame and fetch the new gamestate.
+        prev_gamestate = self._last_gamestate  # for action-clipping reward (pre-step state)
         gamestate = self.console.step()
         self._last_gamestate = gamestate
 
@@ -358,6 +431,38 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         reward += damage_dealt * 0.01  # +0.01 per % dealt
         reward -= damage_taken * 0.01  # -0.01 per % taken
         reward += stocks_taken * 0.5  # +0.5 per stock taken
+
+        # Progressive incentives (Pro-Play reward shaping) — use raw positions from gamestate
+        p1_raw = gamestate.players.get(1) if gamestate else None
+        p2_raw = gamestate.players.get(2) if gamestate else None
+        if p1_raw and p2_raw and hasattr(p1_raw.position, "x") and hasattr(p2_raw.position, "x"):
+            px = float(p1_raw.position.x)
+            py = float(p1_raw.position.y)
+            ox = float(p2_raw.position.x)
+            oy = float(p2_raw.position.y)
+            dx = px - ox
+            dy = py - oy
+            distance = math.sqrt(dx * dx + dy * dy)
+            reward += DISTANCE_REWARD_SCALE * distance  # encourage facing/moving toward opponent
+            off_stage = px < STAGE_LEFT_EDGE or px > STAGE_RIGHT_EDGE
+            if not off_stage and abs(px) < CENTER_STAGE_X_THRESHOLD:
+                reward += CENTER_STAGE_REWARD  # center stage bias (stage control)
+
+        # Action clipping: penalize noise during hitlag or jumpsquat (use pre-step state)
+        if prev_gamestate is not None:
+            p1_prev = prev_gamestate.players.get(1)
+            if p1_prev:
+                hitlag = int(getattr(p1_prev, "hitlag_left", 0) or 0)
+                jumpsquat = int(getattr(p1_prev, "jumpsquat_frames_left", 0) or 0)
+                if (hitlag > 0 or jumpsquat > 0):
+                    noise = (
+                        abs(action.stick_x) > 0.1 or abs(action.stick_y) > 0.1
+                        or abs(action.c_stick_x) > 0.1 or abs(action.c_stick_y) > 0.1
+                        or action.button_a or action.button_b or action.button_z
+                        or action.button_l or action.button_r
+                    )
+                    if noise:
+                        reward += NOISE_PENALTY_HITLAG_JUMPSQUAT
 
         if done:
             if obs.opponent_stocks <= 0:
@@ -384,8 +489,25 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
                 log.warning("Error stopping Dolphin", exc_info=True)
 
     # ------------------------------------------------------------------
-    def _extract_player_physics(self, p, prefix: str) -> dict:
-        """Extract libmelee PlayerState into observation dict. Uses getattr for parity fields."""
+    def _normalize_position(self, x: float, y: float) -> tuple[float, float]:
+        """Scale position relative to FD blastzones to ~[-1, 1]."""
+        norm_x = (x - FD_MID_X) / FD_HALF_WIDTH_X
+        norm_y = (y - FD_MID_Y) / FD_HALF_HEIGHT_Y
+        return (
+            max(-1.0, min(1.0, norm_x)),
+            max(-1.0, min(1.0, norm_y)),
+        )
+
+    def _normalize_speed_y(self, vy: float, terminal: float, max_jump: float) -> float:
+        """Normalize vertical self speed: negative by terminal_velocity, positive by max_jump_velocity."""
+        if vy <= 0:
+            return vy / terminal if terminal > 0 else 0.0
+        return vy / max_jump if max_jump > 0 else 0.0
+
+    def _extract_player_physics(
+        self, p, prefix: str, *, terminal_velocity: float, max_jump_velocity: float, max_horizontal: float
+    ) -> dict:
+        """Extract libmelee PlayerState into observation dict; speeds normalized by character constants."""
         if p is None:
             return {}
 
@@ -400,9 +522,20 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         y_attack = float(g("speed_y_attack", 0))
         on_ground = bool(g("on_ground", True))
 
-        # Total velocity = sum of components (ground uses ground_x, air uses air_x)
-        total_x = (ground_x if on_ground else air_x) + x_attack
-        total_y = y_self + y_attack
+        # Normalize 5 speeds by character limits
+        air_x_n = max(-1.0, min(1.0, air_x / max_horizontal)) if max_horizontal > 0 else 0.0
+        ground_x_n = max(-1.0, min(1.0, ground_x / max_horizontal)) if max_horizontal > 0 else 0.0
+        y_self_n = self._normalize_speed_y(y_self, terminal_velocity, max_jump_velocity)
+        y_self_n = max(-1.0, min(1.0, y_self_n))
+        # Attack knockback can exceed character limits; use same horizontal scale, cap
+        x_attack_n = max(-1.0, min(1.0, x_attack / max(1.0, max_horizontal * 1.5)))
+        y_attack_n = max(-1.0, min(1.0, y_attack / max(terminal_velocity, max_jump_velocity)))
+
+        # Total velocity (normalized) = sum of normalized components
+        total_x = (ground_x_n if on_ground else air_x_n) + x_attack_n
+        total_y = y_self_n + y_attack_n
+        total_x = max(-1.0, min(1.0, total_x))
+        total_y = max(-1.0, min(1.0, total_y))
 
         # ECB: libmelee has ecb_top, ecb_bottom, ecb_left, ecb_right as (x,y) tuples
         def ecb_point(name: str) -> dict:
@@ -427,11 +560,11 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         }
 
         return {
-            f"{prefix}speed_air_x_self": air_x,
-            f"{prefix}speed_ground_x_self": ground_x,
-            f"{prefix}speed_y_self": y_self,
-            f"{prefix}speed_x_attack": x_attack,
-            f"{prefix}speed_y_attack": y_attack,
+            f"{prefix}speed_air_x_self": air_x_n,
+            f"{prefix}speed_ground_x_self": ground_x_n,
+            f"{prefix}speed_y_self": y_self_n,
+            f"{prefix}speed_x_attack": x_attack_n,
+            f"{prefix}speed_y_attack": y_attack_n,
             f"{prefix}speed_x": total_x,
             f"{prefix}speed_y": total_y,
             f"{prefix}on_ground": on_ground,
@@ -501,21 +634,41 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         p1 = gamestate.players.get(1)
         p2 = gamestate.players.get(2)
 
-        phys1 = self._extract_player_physics(p1, "player_")
-        phys2 = self._extract_player_physics(p2, "opponent_")
+        # Positions scaled relative to blastzones (~[-1, 1])
+        if p1 and hasattr(p1.position, "x"):
+            p1_x, p1_y = self._normalize_position(float(p1.position.x), float(p1.position.y))
+        else:
+            p1_x, p1_y = 0.0, 0.0
+        if p2 and hasattr(p2.position, "x"):
+            p2_x, p2_y = self._normalize_position(float(p2.position.x), float(p2.position.y))
+        else:
+            p2_x, p2_y = 0.0, 0.0
+
+        phys1 = self._extract_player_physics(
+            p1, "player_",
+            terminal_velocity=FOX_TERMINAL_VELOCITY,
+            max_jump_velocity=FOX_MAX_JUMP_VELOCITY,
+            max_horizontal=FOX_MAX_HORIZONTAL_SPEED,
+        )
+        phys2 = self._extract_player_physics(
+            p2, "opponent_",
+            terminal_velocity=PUFF_TERMINAL_VELOCITY,
+            max_jump_velocity=PUFF_MAX_JUMP_VELOCITY,
+            max_horizontal=PUFF_MAX_HORIZONTAL_SPEED,
+        )
         projectiles = self._extract_projectiles(gamestate)
 
         return SmashObservation(
-            # Player 1
-            player_x=float(p1.position.x) if p1 else 0.0,
-            player_y=float(p1.position.y) if p1 else 0.0,
+            # Player 1 (positions normalized by blastzones)
+            player_x=p1_x,
+            player_y=p1_y,
             player_damage=int(p1.percent) if p1 else 0,
             player_action_state=p1.action.name if p1 else "unknown",
             player_stocks=int(p1.stock) if p1 else 0,
             **phys1,
-            # Player 2
-            opponent_x=float(p2.position.x) if p2 else 0.0,
-            opponent_y=float(p2.position.y) if p2 else 0.0,
+            # Player 2 (positions normalized by blastzones)
+            opponent_x=p2_x,
+            opponent_y=p2_y,
             opponent_damage=int(p2.percent) if p2 else 0,
             opponent_action_state=p2.action.name if p2 else "unknown",
             opponent_stocks=int(p2.stock) if p2 else 0,

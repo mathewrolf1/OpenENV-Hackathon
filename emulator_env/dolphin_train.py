@@ -137,6 +137,7 @@ class TrainingStats:
     _recent_ep_stocks_lost: deque = field(default_factory=lambda: deque(maxlen=20))
     _recent_ep_lengths: deque = field(default_factory=lambda: deque(maxlen=20))
     _recent_wins: deque = field(default_factory=lambda: deque(maxlen=20))
+    _recent_recovery_success: deque = field(default_factory=lambda: deque(maxlen=20))
 
     _ep_dmg_dealt: float = 0.0
     _ep_dmg_taken: float = 0.0
@@ -181,7 +182,12 @@ class TrainingStats:
         self._prev_opp_stocks = obs.opponent_stocks
         self._prev_self_stocks = obs.player_stocks
 
-    def end_episode(self, ep_reward: float, winner: Optional[int]) -> None:
+    def end_episode(
+        self,
+        ep_reward: float,
+        winner: Optional[int],
+        recovery_success: Optional[bool] = None,
+    ) -> None:
         self.episode_count += 1
         self._recent_ep_rewards.append(ep_reward)
         self._recent_ep_dmg_dealt.append(self._ep_dmg_dealt)
@@ -190,6 +196,8 @@ class TrainingStats:
         self._recent_ep_stocks_lost.append(self._ep_stocks_lost)
         self._recent_ep_lengths.append(self._ep_frames)
         self._recent_wins.append(1.0 if winner == 0 else 0.0)
+        if recovery_success is not None:
+            self._recent_recovery_success.append(1.0 if recovery_success else 0.0)
 
     def _avg(self, d: deque) -> float:
         return sum(d) / len(d) if d else 0.0
@@ -349,13 +357,32 @@ def train(args: argparse.Namespace) -> None:
     batch_size = args.batch_size
 
     stats = TrainingStats(target_frames=args.total_frames)
+    training_mode = getattr(args, "training_mode", "NORMAL")
+    recovery_success_rate_threshold = 0.8
+    # Normalized stage x bounds (server sends positions in [-1, 1]; stage ~ ±0.305)
+    STAGE_NORM_X = 68.4 / 224.0  # ~0.305
+
+    def _recovery_success(observation: SmashObservation) -> bool:
+        """True if agent reached stage (on_ground and |x| within stage)."""
+        return (
+            getattr(observation, "player_on_ground", False)
+            and abs(observation.player_x) <= STAGE_NORM_X
+        )
+
+    def _effective_training_mode() -> str:
+        if training_mode != "RECOVERY":
+            return "NORMAL"
+        if len(stats._recent_recovery_success) < 5:
+            return "RECOVERY"
+        rate = sum(stats._recent_recovery_success) / len(stats._recent_recovery_success)
+        return "NORMAL" if rate >= recovery_success_rate_threshold else "RECOVERY"
 
     print()
     print("=" * 70)
     print(f"  DOLPHIN PPO FINE-TUNING — {args.agent.upper()}")
     print(f"  Checkpoint: {ckpt_path}")
     print(f"  Batch: {batch_size} frames | PPO epochs: {args.ppo_epochs} | LR: {args.lr}")
-    print(f"  Target: {args.total_frames:,} frames")
+    print(f"  Target: {args.total_frames:,} frames | Training mode: {training_mode}")
     print("=" * 70)
     print()
 
@@ -370,8 +397,10 @@ def train(args: argparse.Namespace) -> None:
             batch_dones = []
 
             reward_calc.reset()
-            result = client.reset()
+            effective_mode = _effective_training_mode()
+            result = client.reset(training_mode=effective_mode)
             obs = result.observation
+            ep_recovery_success = False  # set True if agent reaches stage this episode (RECOVERY only)
 
             batch_start = time.time()
             frames_in_batch = 0
@@ -419,7 +448,7 @@ def train(args: argparse.Namespace) -> None:
                     elif next_obs.player_stocks <= 0:
                         winner = 1
                 reward, reward_info = reward_calc.step(
-                    me_proxy, opp_proxy, done=done, winner=winner,
+                    me_proxy, opp_proxy, done=done, winner=winner, action=smash_action,
                 )
 
                 # Store transition
@@ -436,6 +465,9 @@ def train(args: argparse.Namespace) -> None:
                 stats.total_frames = total_frames
                 stats.update_frame(next_obs)
 
+                if training_mode == "RECOVERY" and _recovery_success(next_obs):
+                    ep_recovery_success = True
+
                 # Live frame counter (update every 60 frames = ~1 sec of game)
                 if frames_in_batch % 60 == 0:
                     stats.print_live_frame(next_obs)
@@ -448,14 +480,19 @@ def train(args: argparse.Namespace) -> None:
                         winner_id = 0
                     elif next_obs.player_stocks <= 0:
                         winner_id = 1
-                    stats.end_episode(ep_reward, winner_id)
+                    stats.end_episode(
+                        ep_reward, winner_id,
+                        recovery_success=ep_recovery_success if training_mode == "RECOVERY" else None,
+                    )
                     stats.print_episode(next_obs, ep_reward, winner_id)
                     stats.reset_episode()
 
                     reward_calc.reset()
-                    result = client.reset()
+                    effective_mode = _effective_training_mode()
+                    result = client.reset(training_mode=effective_mode)
                     next_obs = result.observation
                     ep_reward = 0.0
+                    ep_recovery_success = False
 
                 obs = next_obs
 
@@ -521,7 +558,15 @@ def train(args: argparse.Namespace) -> None:
                     value_loss = nn.functional.mse_loss(value, ret_mb)
                     ent_loss = -entropy.mean()
 
-                    loss = policy_loss + 0.5 * value_loss + args.entropy_coef * ent_loss
+                    # Linear entropy decay: start high (exploration), settle to purposeful movement after decay_frames
+                    decay_frames = getattr(args, "entropy_decay_frames", 500_000)
+                    entropy_min = getattr(args, "entropy_coef_min", 0.001)
+                    if total_frames >= decay_frames:
+                        entropy_coef = entropy_min
+                    else:
+                        t = total_frames / max(1, decay_frames)
+                        entropy_coef = args.entropy_coef + (entropy_min - args.entropy_coef) * t
+                    loss = policy_loss + 0.5 * value_loss + entropy_coef * ent_loss
 
                     optim.zero_grad()
                     loss.backward()
@@ -596,6 +641,10 @@ def main() -> None:
         help="Which reward shaping to use",
     )
     parser.add_argument(
+        "--training-mode", type=str, default="NORMAL", choices=("NORMAL", "RECOVERY"),
+        help="NORMAL or RECOVERY. RECOVERY: spawn P1 off-stage each reset; switch to NORMAL when recovery success rate > 80%%",
+    )
+    parser.add_argument(
         "--checkpoint", type=str, default="../checkpoints/puff_final.pt",
         help="Path to sim-trained .pt checkpoint to fine-tune",
     )
@@ -610,7 +659,9 @@ def main() -> None:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lmbda", type=float, default=0.95)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
-    parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.add_argument("--entropy-coef", type=float, default=0.01, help="Initial entropy coefficient (decays linearly over --entropy-decay-frames)")
+    parser.add_argument("--entropy-coef-min", type=float, default=0.001, help="Minimum entropy coefficient after decay")
+    parser.add_argument("--entropy-decay-frames", type=int, default=500_000, help="Frames over which entropy_coef decays to entropy_coef_min")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--checkpoint-interval", type=int, default=50_000)
     parser.add_argument("--device", type=str, default="cpu")

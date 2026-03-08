@@ -1,7 +1,7 @@
-"""Policy inference for mango.pt / jiggly.pt checkpoints.
+"""Policy inference for Fox (P1) and Puff (P2) checkpoints.
 
 Converts SmashObservation <-> 26-dim sim obs and MultiDiscrete action <-> SmashAction.
-Shared by the emulator server (mango.pt on P2) and train_emulator client (jiggly.pt on P1).
+Shared by the emulator server (puff_final.pt on P2) and train_emulator client (Fox policy on P1).
 """
 
 from __future__ import annotations
@@ -96,10 +96,11 @@ def _player_vec(
     on_ground: bool, facing_right: bool,
     action_state: str, hitstun: float,
 ) -> np.ndarray:
+    """Build 13-dim player vector. Positions and speeds are expected normalized in [-1,1] from OpenEnv server."""
     act = map_action_state(action_state)
     return np.array([
-        x / 100.0, y / 100.0,
-        speed_x / 5.0, speed_y / 5.0, 0.0, 0.0,
+        x, y,
+        speed_x, speed_y, 0.0, 0.0,
         damage / 200.0, stocks / 4.0,
         float(on_ground), float(facing_right),
         float(act) / float(Action.NUM_ACTIONS), 0.0,
