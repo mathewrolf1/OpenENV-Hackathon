@@ -1,13 +1,26 @@
 # models.py
 """Pydantic models that define the OpenEnv contract for the Smash emulator.
 These models are used by both the server (Environment) and any client that talks to it.
+
+Observation fields mirror libmelee.PlayerState and libmelee.GameState for
+100% data parity with the Dolphin emulator.
 """
 
-from typing import Annotated
+from typing import Annotated, Any, Dict, List
 
 from pydantic import Field
 
 from openenv.core.env_server.types import Action, Observation
+
+
+# ---------------------------------------------------------------------------
+# Nested structures for libmelee parity (ECB, Projectile)
+# ---------------------------------------------------------------------------
+
+def _ecb_default() -> Dict[str, Dict[str, float]]:
+    """Default ECB: four points (top, bottom, left, right) with (x, y) offsets."""
+    zero = {"x": 0.0, "y": 0.0}
+    return {"top": zero.copy(), "bottom": zero.copy(), "left": zero.copy(), "right": zero.copy()}
 
 
 class SmashAction(Action):
@@ -91,18 +104,53 @@ class SmashObservation(Observation):
         0, description="Remaining stock count for the opponent"
     )
 
-    # --- Physics / state (for reward shaping) ---
+    # --- Physics / state (5-speed system, libmelee parity) ---
+    # Player 1 — 5-speed breakdown
+    player_speed_air_x_self: float = Field(0.0, description="Player horizontal air speed (self)")
+    player_speed_ground_x_self: float = Field(0.0, description="Player horizontal ground speed (self)")
+    player_speed_y_self: float = Field(0.0, description="Player vertical speed (gravity/jump)")
+    player_speed_x_attack: float = Field(0.0, description="Player horizontal speed from knockback")
+    player_speed_y_attack: float = Field(0.0, description="Player vertical speed from knockback")
+    # Player 1 — computed totals (for reward shaping)
     player_speed_x: float = Field(0.0, description="Player total X velocity")
     player_speed_y: float = Field(0.0, description="Player total Y velocity")
     player_on_ground: bool = Field(True, description="Whether the player is grounded")
     player_facing_right: bool = Field(True, description="Whether the player faces right")
     player_hitstun_left: int = Field(0, description="Player hitstun frames remaining")
+    player_hitlag_left: int = Field(0, description="Player hitlag frames (frozen on hit)")
+    player_jumpsquat_frames_left: int = Field(0, description="Player jumpsquat frames remaining")
+    player_invulnerability_left: int = Field(0, description="Player invincibility frames remaining")
+    player_shield_strength: float = Field(60.0, description="Player shield (60 max, 0 = broken)")
+    player_ecb: Dict[str, Dict[str, float]] = Field(
+        default_factory=_ecb_default,
+        description="Player ECB: top/bottom/left/right with {x,y} offsets from root",
+    )
 
+    # Player 2 — 5-speed breakdown
+    opponent_speed_air_x_self: float = Field(0.0, description="Opponent horizontal air speed (self)")
+    opponent_speed_ground_x_self: float = Field(0.0, description="Opponent horizontal ground speed (self)")
+    opponent_speed_y_self: float = Field(0.0, description="Opponent vertical speed (gravity/jump)")
+    opponent_speed_x_attack: float = Field(0.0, description="Opponent horizontal speed from knockback")
+    opponent_speed_y_attack: float = Field(0.0, description="Opponent vertical speed from knockback")
     opponent_speed_x: float = Field(0.0, description="Opponent total X velocity")
     opponent_speed_y: float = Field(0.0, description="Opponent total Y velocity")
     opponent_on_ground: bool = Field(True, description="Whether the opponent is grounded")
     opponent_facing_right: bool = Field(True, description="Whether the opponent faces right")
     opponent_hitstun_left: int = Field(0, description="Opponent hitstun frames remaining")
+    opponent_hitlag_left: int = Field(0, description="Opponent hitlag frames (frozen on hit)")
+    opponent_jumpsquat_frames_left: int = Field(0, description="Opponent jumpsquat frames remaining")
+    opponent_invulnerability_left: int = Field(0, description="Opponent invincibility frames remaining")
+    opponent_shield_strength: float = Field(60.0, description="Opponent shield (60 max, 0 = broken)")
+    opponent_ecb: Dict[str, Dict[str, float]] = Field(
+        default_factory=_ecb_default,
+        description="Opponent ECB: top/bottom/left/right with {x,y} offsets from root",
+    )
+
+    # Projectiles (libmelee.GameState.projectiles)
+    projectiles: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="List of projectiles: {x, y, speed_x, speed_y, owner_id}",
+    )
 
     frame: int = Field(0, description="Current game frame number")
 

@@ -77,34 +77,59 @@ class EmulatorEnv(EnvClient[SmashAction, SmashObservation, State]):
             StepResult with SmashObservation
         """
         obs_data = payload.get("observation", {})
+        _get = obs_data.get
+
+        def _ecb(key: str):
+            return _get(key, {"top": {"x": 0, "y": 0}, "bottom": {"x": 0, "y": 0}, "left": {"x": 0, "y": 0}, "right": {"x": 0, "y": 0}})
+
         observation = SmashObservation(
             # Player 1 (agent)
-            player_x=obs_data.get("player_x", 0.0),
-            player_y=obs_data.get("player_y", 0.0),
-            player_damage=obs_data.get("player_damage", 0),
-            player_action_state=obs_data.get("player_action_state", "unknown"),
-            player_stocks=obs_data.get("player_stocks", 0),
-            # Player 1 physics
-            player_speed_x=obs_data.get("player_speed_x", 0.0),
-            player_speed_y=obs_data.get("player_speed_y", 0.0),
-            player_on_ground=obs_data.get("player_on_ground", True),
-            player_facing_right=obs_data.get("player_facing_right", True),
-            player_hitstun_left=obs_data.get("player_hitstun_left", 0),
+            player_x=_get("player_x", 0.0),
+            player_y=_get("player_y", 0.0),
+            player_damage=_get("player_damage", 0),
+            player_action_state=_get("player_action_state", "unknown"),
+            player_stocks=_get("player_stocks", 0),
+            # Player 1 physics (5-speed + timers + shield + ECB)
+            player_speed_air_x_self=_get("player_speed_air_x_self", 0.0),
+            player_speed_ground_x_self=_get("player_speed_ground_x_self", 0.0),
+            player_speed_y_self=_get("player_speed_y_self", 0.0),
+            player_speed_x_attack=_get("player_speed_x_attack", 0.0),
+            player_speed_y_attack=_get("player_speed_y_attack", 0.0),
+            player_speed_x=_get("player_speed_x", 0.0),
+            player_speed_y=_get("player_speed_y", 0.0),
+            player_on_ground=_get("player_on_ground", True),
+            player_facing_right=_get("player_facing_right", True),
+            player_hitstun_left=_get("player_hitstun_left", 0),
+            player_hitlag_left=_get("player_hitlag_left", 0),
+            player_jumpsquat_frames_left=_get("player_jumpsquat_frames_left", 0),
+            player_invulnerability_left=_get("player_invulnerability_left", 0),
+            player_shield_strength=_get("player_shield_strength", 60.0),
+            player_ecb=_ecb("player_ecb"),
             # Player 2 (opponent)
-            opponent_x=obs_data.get("opponent_x", 0.0),
-            opponent_y=obs_data.get("opponent_y", 0.0),
-            opponent_damage=obs_data.get("opponent_damage", 0),
-            opponent_action_state=obs_data.get("opponent_action_state", "unknown"),
-            opponent_stocks=obs_data.get("opponent_stocks", 0),
-            # Player 2 physics
-            opponent_speed_x=obs_data.get("opponent_speed_x", 0.0),
-            opponent_speed_y=obs_data.get("opponent_speed_y", 0.0),
-            opponent_on_ground=obs_data.get("opponent_on_ground", True),
-            opponent_facing_right=obs_data.get("opponent_facing_right", True),
-            opponent_hitstun_left=obs_data.get("opponent_hitstun_left", 0),
+            opponent_x=_get("opponent_x", 0.0),
+            opponent_y=_get("opponent_y", 0.0),
+            opponent_damage=_get("opponent_damage", 0),
+            opponent_action_state=_get("opponent_action_state", "unknown"),
+            opponent_stocks=_get("opponent_stocks", 0),
+            opponent_speed_air_x_self=_get("opponent_speed_air_x_self", 0.0),
+            opponent_speed_ground_x_self=_get("opponent_speed_ground_x_self", 0.0),
+            opponent_speed_y_self=_get("opponent_speed_y_self", 0.0),
+            opponent_speed_x_attack=_get("opponent_speed_x_attack", 0.0),
+            opponent_speed_y_attack=_get("opponent_speed_y_attack", 0.0),
+            opponent_speed_x=_get("opponent_speed_x", 0.0),
+            opponent_speed_y=_get("opponent_speed_y", 0.0),
+            opponent_on_ground=_get("opponent_on_ground", True),
+            opponent_facing_right=_get("opponent_facing_right", True),
+            opponent_hitstun_left=_get("opponent_hitstun_left", 0),
+            opponent_hitlag_left=_get("opponent_hitlag_left", 0),
+            opponent_jumpsquat_frames_left=_get("opponent_jumpsquat_frames_left", 0),
+            opponent_invulnerability_left=_get("opponent_invulnerability_left", 0),
+            opponent_shield_strength=_get("opponent_shield_strength", 60.0),
+            opponent_ecb=_ecb("opponent_ecb"),
             # General
-            frame=obs_data.get("frame", 0),
-            menu_state=obs_data.get("menu_state", "unknown"),
+            projectiles=_get("projectiles", []),
+            frame=_get("frame", 0),
+            menu_state=_get("menu_state", "unknown"),
         )
 
         return StepResult(

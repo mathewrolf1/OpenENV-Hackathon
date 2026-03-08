@@ -325,6 +325,81 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
                 log.warning("Error stopping Dolphin", exc_info=True)
 
     # ------------------------------------------------------------------
+    def _extract_player_physics(self, p, prefix: str) -> dict:
+        """Extract libmelee PlayerState into observation dict. Uses getattr for parity fields."""
+        if p is None:
+            return {}
+
+        def g(name, default=0):
+            return getattr(p, name, default)
+
+        # 5-speed system (libmelee parity)
+        air_x = float(g("speed_air_x_self", 0))
+        ground_x = float(g("speed_ground_x_self", 0))
+        y_self = float(g("speed_y_self", 0))
+        x_attack = float(g("speed_x_attack", 0))
+        y_attack = float(g("speed_y_attack", 0))
+        on_ground = bool(g("on_ground", True))
+
+        # Total velocity = sum of components (ground uses ground_x, air uses air_x)
+        total_x = (ground_x if on_ground else air_x) + x_attack
+        total_y = y_self + y_attack
+
+        # ECB: libmelee has ecb_top, ecb_bottom, ecb_left, ecb_right as (x,y) tuples
+        def ecb_point(name: str) -> dict:
+            pt = g(name, (0.0, 0.0))
+            if hasattr(pt, "x") and hasattr(pt, "y"):
+                return {"x": float(pt.x), "y": float(pt.y)}
+            if isinstance(pt, (tuple, list)) and len(pt) >= 2:
+                return {"x": float(pt[0]), "y": float(pt[1])}
+            return {"x": 0.0, "y": 0.0}
+
+        ecb = {
+            "top": ecb_point("ecb_top"),
+            "bottom": ecb_point("ecb_bottom"),
+            "left": ecb_point("ecb_left"),
+            "right": ecb_point("ecb_right"),
+        }
+
+        return {
+            f"{prefix}speed_air_x_self": air_x,
+            f"{prefix}speed_ground_x_self": ground_x,
+            f"{prefix}speed_y_self": y_self,
+            f"{prefix}speed_x_attack": x_attack,
+            f"{prefix}speed_y_attack": y_attack,
+            f"{prefix}speed_x": total_x,
+            f"{prefix}speed_y": total_y,
+            f"{prefix}on_ground": on_ground,
+            f"{prefix}facing_right": bool(g("facing", True)),
+            f"{prefix}hitstun_left": int(g("hitstun_frames_left", 0)),
+            f"{prefix}hitlag_left": int(g("hitlag_left", 0)),
+            f"{prefix}jumpsquat_frames_left": int(g("jumpsquat_frames_left", 0)),
+            f"{prefix}invulnerability_left": int(g("invulnerability_left", 0)),
+            f"{prefix}shield_strength": float(g("shield_strength", 60.0)),
+            f"{prefix}ecb": ecb,
+        }
+
+    def _extract_projectiles(self, gamestate) -> list:
+        """Extract projectiles from libmelee GameState."""
+        projs = getattr(gamestate, "projectiles", None) or []
+        out = []
+        for pr in projs:
+            pos = getattr(pr, "position", None) or (0.0, 0.0)
+            spd = getattr(pr, "speed", None) or (0.0, 0.0)
+            owner = getattr(pr, "owner", -1)
+            if hasattr(pos, "x"):
+                x, y = float(pos.x), float(pos.y)
+            else:
+                x = float(pos[0]) if len(pos) > 0 else 0.0
+                y = float(pos[1]) if len(pos) > 1 else 0.0
+            if hasattr(spd, "x"):
+                sx, sy = float(spd.x), float(spd.y)
+            else:
+                sx = float(spd[0]) if len(spd) > 0 else 0.0
+                sy = float(spd[1]) if len(spd) > 1 else 0.0
+            out.append({"x": x, "y": y, "speed_x": sx, "speed_y": sy, "owner_id": int(owner)})
+        return out
+
     def _make_observation(
         self,
         gamestate,
@@ -359,6 +434,10 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         p1 = gamestate.players.get(1)
         p2 = gamestate.players.get(2)
 
+        phys1 = self._extract_player_physics(p1, "player_")
+        phys2 = self._extract_player_physics(p2, "opponent_")
+        projectiles = self._extract_projectiles(gamestate)
+
         return SmashObservation(
             # Player 1
             player_x=float(p1.position.x) if p1 else 0.0,
@@ -366,26 +445,17 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
             player_damage=int(p1.percent) if p1 else 0,
             player_action_state=p1.action.name if p1 else "unknown",
             player_stocks=int(p1.stock) if p1 else 0,
-            # Player 1 physics
-            player_speed_x=float(getattr(p1, 'speed_x_attack', 0) + getattr(p1, 'speed_ground_x_self', 0)) if p1 else 0.0,
-            player_speed_y=float(getattr(p1, 'speed_y_attack', 0) + getattr(p1, 'speed_y_self', 0)) if p1 else 0.0,
-            player_on_ground=bool(p1.on_ground) if p1 else True,
-            player_facing_right=bool(p1.facing) if p1 else True,
-            player_hitstun_left=int(p1.hitstun_frames_left) if p1 else 0,
+            **phys1,
             # Player 2
             opponent_x=float(p2.position.x) if p2 else 0.0,
             opponent_y=float(p2.position.y) if p2 else 0.0,
             opponent_damage=int(p2.percent) if p2 else 0,
             opponent_action_state=p2.action.name if p2 else "unknown",
             opponent_stocks=int(p2.stock) if p2 else 0,
-            # Player 2 physics
-            opponent_speed_x=float(getattr(p2, 'speed_x_attack', 0) + getattr(p2, 'speed_ground_x_self', 0)) if p2 else 0.0,
-            opponent_speed_y=float(getattr(p2, 'speed_y_attack', 0) + getattr(p2, 'speed_y_self', 0)) if p2 else 0.0,
-            opponent_on_ground=bool(p2.on_ground) if p2 else True,
-            opponent_facing_right=bool(p2.facing) if p2 else True,
-            opponent_hitstun_left=int(p2.hitstun_frames_left) if p2 else 0,
+            **phys2,
             # General
-            frame=int(gamestate.frame) if hasattr(gamestate, 'frame') else 0,
+            projectiles=projectiles,
+            frame=int(gamestate.frame) if hasattr(gamestate, "frame") else 0,
             menu_state=menu_state_str,
             reward=reward,
             done=done,
