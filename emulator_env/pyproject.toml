@@ -22,6 +22,9 @@ dependencies = [
     "melee",
     # .env file support (transitive via pydantic-settings, but made explicit)
     "python-dotenv",
+    # Model inference (train_emulator.py)
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]

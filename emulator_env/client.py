@@ -80,7 +80,27 @@ class EmulatorEnv(EnvClient[SmashAction, SmashObservation, State]):
         _get = obs_data.get
 
         def _ecb(key: str):
-            return _get(key, {"top": {"x": 0, "y": 0}, "bottom": {"x": 0, "y": 0}, "left": {"x": 0, "y": 0}, "right": {"x": 0, "y": 0}})
+            default_ecb = {
+                "top": {"x": 0.0, "y": 0.0},
+                "bottom": {"x": 0.0, "y": 0.0},
+                "left": {"x": 0.0, "y": 0.0},
+                "right": {"x": 0.0, "y": 0.0},
+            }
+            raw = _get(key, default_ecb)
+            if not isinstance(raw, dict):
+                return default_ecb
+            # Ensure all sub-points have non-None float values
+            result = {}
+            for point_name in ("top", "bottom", "left", "right"):
+                pt = raw.get(point_name) if isinstance(raw, dict) else None
+                if isinstance(pt, dict):
+                    result[point_name] = {
+                        "x": float(pt.get("x", 0.0) or 0.0),
+                        "y": float(pt.get("y", 0.0) or 0.0),
+                    }
+                else:
+                    result[point_name] = {"x": 0.0, "y": 0.0}
+            return result
 
         observation = SmashObservation(
             # Player 1 (agent)

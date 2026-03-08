@@ -137,7 +137,7 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         self.cpu_menu_helper = melee.MenuHelper()
 
         # Configurable match parameters (can be exposed later).
-        self._character = melee.Character.FOX
+        self._character = melee.Character.JIGGLYPUFF
         self._cpu_character = melee.Character.FALCO
         self._stage = melee.Stage.FINAL_DESTINATION
         self._cpu_level = 3  # CPU difficulty 1-9
@@ -296,15 +296,15 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
         stocks_taken = max(0, self._prev_opponent_stocks - obs.opponent_stocks)
 
         reward = 0.0
-        reward += damage_dealt * 0.01   # +0.01 per % dealt
-        reward -= damage_taken * 0.01   # -0.01 per % taken
-        reward += stocks_taken * 0.5    # +0.5 per stock taken
+        reward += damage_dealt * 0.01  # +0.01 per % dealt
+        reward -= damage_taken * 0.01  # -0.01 per % taken
+        reward += stocks_taken * 0.5  # +0.5 per stock taken
 
         if done:
             if obs.opponent_stocks <= 0:
-                reward += 1.0           # win bonus
+                reward += 1.0  # win bonus
             elif obs.player_stocks <= 0:
-                reward -= 1.0           # loss penalty
+                reward -= 1.0  # loss penalty
 
         # Update trackers for next frame
         self._prev_player_damage = obs.player_damage
@@ -347,11 +347,17 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
 
         # ECB: libmelee has ecb_top, ecb_bottom, ecb_left, ecb_right as (x,y) tuples
         def ecb_point(name: str) -> dict:
-            pt = g(name, (0.0, 0.0))
+            pt = g(name, None)
+            if pt is None:
+                return {"x": 0.0, "y": 0.0}
             if hasattr(pt, "x") and hasattr(pt, "y"):
-                return {"x": float(pt.x), "y": float(pt.y)}
+                x_val = pt.x if pt.x is not None else 0.0
+                y_val = pt.y if pt.y is not None else 0.0
+                return {"x": float(x_val), "y": float(y_val)}
             if isinstance(pt, (tuple, list)) and len(pt) >= 2:
-                return {"x": float(pt[0]), "y": float(pt[1])}
+                x_val = pt[0] if pt[0] is not None else 0.0
+                y_val = pt[1] if pt[1] is not None else 0.0
+                return {"x": float(x_val), "y": float(y_val)}
             return {"x": 0.0, "y": 0.0}
 
         ecb = {
@@ -397,7 +403,9 @@ class EmulatorEnvServer(Environment[SmashAction, SmashObservation, State]):
             else:
                 sx = float(spd[0]) if len(spd) > 0 else 0.0
                 sy = float(spd[1]) if len(spd) > 1 else 0.0
-            out.append({"x": x, "y": y, "speed_x": sx, "speed_y": sy, "owner_id": int(owner)})
+            out.append(
+                {"x": x, "y": y, "speed_x": sx, "speed_y": sy, "owner_id": int(owner)}
+            )
         return out
 
     def _make_observation(
