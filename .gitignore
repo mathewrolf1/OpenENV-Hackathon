@@ -42,6 +42,9 @@ yarn-error.log*
 *.swo
 .vscode/
 
+# Windows reserved device names (NUL, CON, PRN, etc.)
+nul
+
 # Coverage and test
 coverage/
 .coverage
